@@ -1776,6 +1776,7 @@ impl State {
     }
 
     pub fn apply_instructions(&mut self, instructions: &Vec<Instruction>) {
+        crate::prof_scope!(crate::prof::sec::APPLY);
         for i in instructions {
             self.apply_one_instruction(i)
         }
@@ -1963,6 +1964,7 @@ impl State {
     }
 
     pub fn reverse_instructions(&mut self, instructions: &Vec<Instruction>) {
+        crate::prof_scope!(crate::prof::sec::REVERSE);
         for i in instructions.iter().rev() {
             self.reverse_one_instruction(i);
         }

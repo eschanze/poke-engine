@@ -45,6 +45,9 @@ struct Args {
     /// UCB1 exploration constant for A
     #[clap(long, default_value_t = DEFAULT_EXPLORATION_CONSTANT)]
     a_c: f32,
+    /// A branches on damage rolls/crits at every depth (pass =false for 2-ply-only)
+    #[clap(long, action = clap::ArgAction::Set, default_value_t = true)]
+    a_branch_all: bool,
 
     #[clap(long, default_value_t = 20000)]
     b_iterations: u32,
@@ -55,6 +58,9 @@ struct Args {
     /// UCB1 exploration constant for B
     #[clap(long, default_value_t = DEFAULT_EXPLORATION_CONSTANT)]
     b_c: f32,
+    /// B branches on damage rolls/crits at every depth (pass =false for 2-ply-only)
+    #[clap(long, action = clap::ArgAction::Set, default_value_t = true)]
+    b_branch_all: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -63,13 +69,18 @@ struct EngineConfig {
     time_ms: u64,
     threads: usize,
     exploration_constant: f32,
+    branch_all_depths: bool,
 }
 
 impl EngineConfig {
     fn describe(&self) -> String {
         format!(
-            "iterations={} time_ms={} threads={} c={}",
-            self.iterations, self.time_ms, self.threads, self.exploration_constant
+            "iterations={} time_ms={} threads={} c={} branch_all={}",
+            self.iterations,
+            self.time_ms,
+            self.threads,
+            self.exploration_constant,
+            self.branch_all_depths
         )
     }
 }
@@ -95,6 +106,11 @@ fn pick_move(state: &mut State, config: &EngineConfig, role: &SideRole) -> MoveC
         _ => {}
     }
 
+    // searches run sequentially, so a process-global knob is safe here
+    poke_engine::mcts::BRANCH_ALL_DEPTHS.store(
+        config.branch_all_depths,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let max_time = Duration::from_millis(config.time_ms);
     let result = if config.threads > 1 {
         perform_mcts_shared_tree(
@@ -260,12 +276,14 @@ fn main() {
         time_ms: args.a_time_ms,
         threads: args.a_threads,
         exploration_constant: args.a_c,
+        branch_all_depths: args.a_branch_all,
     };
     let config_b = EngineConfig {
         iterations: args.b_iterations,
         time_ms: args.b_time_ms,
         threads: args.b_threads,
         exploration_constant: args.b_c,
+        branch_all_depths: args.b_branch_all,
     };
     println!("A: {}", config_a.describe());
     println!("B: {}", config_b.describe());

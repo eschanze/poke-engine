@@ -88,5 +88,10 @@ fn main() {
 
     let elapsed_time = start_time.elapsed().as_secs_f64();
     println!("Took: {} seconds", elapsed_time);
+
+    // thread-local counters: only meaningful for single-threaded runs (-n 1)
+    #[cfg(feature = "prof")]
+    poke_engine::prof::report();
+
     exit(0);
 }

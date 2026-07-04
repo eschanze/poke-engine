@@ -5,7 +5,6 @@ use crate::instruction::{Instruction, StateInstructions};
 use crate::state::State;
 use rand::prelude::*;
 use rand::rngs::SmallRng;
-use std::collections::HashMap;
 use std::time::Duration;
 
 // UCB1 exploration constant c in `avg + c * sqrt(ln(N) / n)`.
@@ -13,6 +12,17 @@ use std::time::Duration;
 // sqrt(2) by ~+87 Elo at 20k iterations and ~+108 Elo at 100ms/12-thread
 // searches; 0.3 and 0.75 measured slightly worse than 0.5.
 pub const DEFAULT_EXPLORATION_CONSTANT: f32 = 0.5;
+
+// When true (default since 2026-07-04), damage-roll/crit branching happens
+// at every tree depth instead of only the first two plies: damage nodes
+// split into KO/no-KO (or crit/no-crit) outcomes weighted by roll
+// probability. Selfplay-validated as Elo-neutral vs the 2-ply limit at both
+// 20k-iteration and 100ms/12T budgets (612 + 50 games, see WORKLOG), and it
+// models kill ranges honestly deep in the tree. The selfplay harness can
+// flip it per side (--a-branch-all/--b-branch-all) to re-test after eval
+// changes. Not part of the public API.
+pub static BRANCH_ALL_DEPTHS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
 
 // Approximate cap on tree memory, replacing the old fixed 10M iteration cap.
 // The estimate under-counts allocator overhead, so keep some headroom below
@@ -54,6 +64,11 @@ pub struct Node {
     // de-coupled for s1 and s2
     pub s1_options: Option<Vec<MoveNode>>,
     pub s2_options: Option<Vec<MoveNode>>,
+
+    // expanded move-pairs: (s1_idx * s2_options.len() + s2_idx, outcome
+    // branch). A linear scan beats any hash map here: most nodes only ever
+    // expand a handful of pairs, and the entries are hot in cache
+    pub children: Vec<(u32, Box<[Node]>)>,
 }
 
 impl Node {
@@ -67,6 +82,7 @@ impl Node {
             s2_choice: 0,
             s1_options: None,
             s2_options: None,
+            children: Vec::new(),
         }
     }
     unsafe fn populate(&mut self, s1_options: Vec<MoveChoice>, s2_options: Vec<MoveChoice>) {
@@ -109,11 +125,11 @@ impl Node {
     pub unsafe fn selection(
         &mut self,
         state: &mut State,
-        children: &mut HashMap<(usize, usize, usize), Box<[Node]>>,
         rng: &mut impl Rng,
         exploration_sq: f32,
     ) -> (*mut Node, usize, usize) {
         if self.s1_options.is_none() {
+            crate::prof_scope!(crate::prof::sec::GET_OPTIONS);
             let (s1_options, s2_options) = state.get_all_options();
             self.populate(s1_options, s2_options);
         }
@@ -122,16 +138,15 @@ impl Node {
             self.maximize_ucb_for_side(self.s1_options.as_ref().unwrap(), exploration_sq);
         let s2_mc_index =
             self.maximize_ucb_for_side(self.s2_options.as_ref().unwrap(), exploration_sq);
-        let key = (self as *mut Node as usize, s1_mc_index, s2_mc_index);
-        match children.get_mut(&key) {
-            Some(child_vector) => {
-                let child_vec_ptr = child_vector as *mut Box<[Node]>;
-                let chosen_child = self.sample_node(child_vec_ptr, rng);
-                state.apply_instructions(&(*chosen_child).instructions.instruction_list);
-                (*chosen_child).selection(state, children, rng, exploration_sq)
-            }
-            None => (self as *mut Node, s1_mc_index, s2_mc_index),
-        }
+        let key = (s1_mc_index * self.s2_options.as_ref().unwrap().len() + s2_mc_index) as u32;
+        let child_vec_ptr: *mut Box<[Node]> =
+            match self.children.iter_mut().find(|(k, _)| *k == key) {
+                Some(entry) => &mut entry.1,
+                None => return (self as *mut Node, s1_mc_index, s2_mc_index),
+            };
+        let chosen_child = self.sample_node(child_vec_ptr, rng);
+        state.apply_instructions(&(*chosen_child).instructions.instruction_list);
+        (*chosen_child).selection(state, rng, exploration_sq)
     }
 
     unsafe fn sample_node(&self, move_vector: *mut Box<[Node]>, rng: &mut impl Rng) -> *mut Node {
@@ -160,7 +175,6 @@ impl Node {
         state: &mut State,
         s1_move_index: usize,
         s2_move_index: usize,
-        children: &mut HashMap<(usize, usize, usize), Box<[Node]>>,
         rng: &mut impl Rng,
         tree_bytes: &mut u64,
     ) -> *mut Node {
@@ -172,9 +186,13 @@ impl Node {
         {
             return self as *mut Node;
         }
-        let should_branch_on_damage = self.root || (*self.parent).root;
-        let mut new_instructions =
-            generate_instructions_from_move_pair(state, s1_move, s2_move, should_branch_on_damage);
+        let should_branch_on_damage = self.root
+            || (*self.parent).root
+            || BRANCH_ALL_DEPTHS.load(std::sync::atomic::Ordering::Relaxed);
+        let mut new_instructions = {
+            crate::prof_scope!(crate::prof::sec::GEN_INS);
+            generate_instructions_from_move_pair(state, s1_move, s2_move, should_branch_on_damage)
+        };
         let mut this_pair_vec = Vec::with_capacity(new_instructions.len());
         for state_instructions in new_instructions.drain(..) {
             let mut new_node = Node::new();
@@ -185,18 +203,19 @@ impl Node {
             this_pair_vec.push(new_node);
         }
 
-        // sample a node from the new instruction list.
-        // this is the node that the rollout will be done on.
         // into_boxed_slice drops the Vec's spare capacity and, more importantly,
-        // makes it a type that cannot be resized, which ensures the node
-        // addresses are stable for the children map keys
-        let mut boxed = this_pair_vec.into_boxed_slice();
-        let new_node_ptr = self.sample_node(&mut boxed, rng);
-        state.apply_instructions(&(*new_node_ptr).instructions.instruction_list);
-
-        let key = (self as *mut Node as usize, s1_move_index, s2_move_index);
+        // makes it a type that cannot be resized: parent pointers reference
+        // nodes inside this heap slice, and while the children Vec may
+        // reallocate (moving the Box), the slice itself never moves
+        let boxed = this_pair_vec.into_boxed_slice();
         *tree_bytes += approx_branch_bytes(&boxed);
-        children.insert(key, boxed);
+        let key = (s1_move_index * self.s2_options.as_ref().unwrap().len() + s2_move_index) as u32;
+        self.children.push((key, boxed));
+
+        // sample a node from the new branch; the rollout will be done on it
+        let branch: *mut Box<[Node]> = &mut self.children.last_mut().unwrap().1;
+        let new_node_ptr = self.sample_node(branch, rng);
+        state.apply_instructions(&(*new_node_ptr).instructions.instruction_list);
         new_node_ptr
     }
 
@@ -291,16 +310,26 @@ fn mcts_iteration(
     root_node: &mut Node,
     state: &mut State,
     root_eval: &f32,
-    children: &mut HashMap<(usize, usize, usize), Box<[Node]>>,
     rng: &mut impl Rng,
     tree_bytes: &mut u64,
     exploration_sq: f32,
 ) {
-    let (mut new_node, s1_move, s2_move) =
-        unsafe { root_node.selection(state, children, rng, exploration_sq) };
-    new_node = unsafe { (*new_node).expand(state, s1_move, s2_move, children, rng, tree_bytes) };
-    let rollout_result = unsafe { (*new_node).rollout(state, root_eval) };
-    unsafe { (*new_node).backpropagate(rollout_result, state) }
+    let (mut new_node, s1_move, s2_move) = {
+        crate::prof_scope!(crate::prof::sec::SELECTION);
+        unsafe { root_node.selection(state, rng, exploration_sq) }
+    };
+    new_node = {
+        crate::prof_scope!(crate::prof::sec::EXPAND);
+        unsafe { (*new_node).expand(state, s1_move, s2_move, rng, tree_bytes) }
+    };
+    let rollout_result = {
+        crate::prof_scope!(crate::prof::sec::ROLLOUT);
+        unsafe { (*new_node).rollout(state, root_eval) }
+    };
+    {
+        crate::prof_scope!(crate::prof::sec::BACKPROP);
+        unsafe { (*new_node).backpropagate(rollout_result, state) }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -314,7 +343,6 @@ fn run_mcts_loop(
     root_node: &mut Node,
     state: &mut State,
     root_eval: &f32,
-    children: &mut HashMap<(usize, usize, usize), Box<[Node]>>,
     limit: SearchLimit,
     exploration_sq: f32,
 ) {
@@ -329,7 +357,6 @@ fn run_mcts_loop(
                 root_node,
                 state,
                 root_eval,
-                children,
                 &mut rng,
                 &mut tree_bytes,
                 exploration_sq,
@@ -371,7 +398,6 @@ pub fn perform_mcts(
         root_node.populate(side_one_options, side_two_options);
     }
     root_node.root = true;
-    let mut children: HashMap<(usize, usize, usize), Box<[Node]>> = HashMap::new();
 
     let root_eval = evaluate(state);
     let search_limit = if max_iterations > 0 && max_time > Duration::from_millis(0) {
@@ -385,7 +411,6 @@ pub fn perform_mcts(
         &mut root_node,
         state,
         &root_eval,
-        &mut children,
         search_limit,
         exploration_constant * exploration_constant,
     );

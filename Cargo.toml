@@ -30,6 +30,7 @@ debug = 1
 dashmap = "6.1.0"
 clap = { version = "4.5.4", features = ["derive"] }
 rand = { version = "0.9.3", features = ["small_rng"] }
+rustc-hash = "2"
 
 [features]
 remove_low_chance_instructions = []
@@ -43,6 +44,8 @@ gen7 = []
 gen8 = []
 gen9 = []
 terastallization = ["gen9"]
+# hot-path profiling counters (see src/prof.rs); combine with a gen feature
+prof = []
 
 default = []
 

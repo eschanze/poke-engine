@@ -9,6 +9,7 @@ use crate::state::State;
 use dashmap::DashMap;
 use rand::prelude::*;
 use rand::rngs::SmallRng;
+use rustc_hash::FxBuildHasher;
 use std::sync::atomic::{AtomicI8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
@@ -31,7 +32,7 @@ fn approx_branch_bytes(nodes: &[Node]) -> u64 {
 // Node map type alias for clarity.
 // key: (parent node address, s1_move_index, s2_move_index)
 // value: the branch (weighted list of outcome nodes for that move pair)
-type ChildMap = DashMap<(usize, usize, usize), SharedBranch>;
+type ChildMap = DashMap<(usize, usize, usize), SharedBranch, FxBuildHasher>;
 
 fn sigmoid(x: f32) -> f32 {
     // Tuned so that ~200 points is very close to 1.0
@@ -282,7 +283,8 @@ impl Node {
             return None;
         }
 
-        let should_branch_on_damage = self.depth < MCTS_DAMAGE_BRANCH_DEPTH;
+        let should_branch_on_damage = self.depth < MCTS_DAMAGE_BRANCH_DEPTH
+            || crate::mcts::BRANCH_ALL_DEPTHS.load(Ordering::Relaxed);
         let instructions =
             generate_instructions_from_move_pair(state, s1_move, s2_move, should_branch_on_damage);
 
@@ -475,7 +477,8 @@ pub fn perform_mcts_shared_tree(
     let tree_bytes = Arc::new(AtomicU64::new(0));
 
     // global map shared by all threads.
-    let children: Arc<ChildMap> = Arc::new(DashMap::with_capacity(1 << 16));
+    let children: Arc<ChildMap> =
+        Arc::new(DashMap::with_capacity_and_hasher(1 << 16, FxBuildHasher));
 
     thread::scope(|scope| {
         for _ in 0..worker_count {

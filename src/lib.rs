@@ -21,6 +21,7 @@ pub mod io;
 pub mod mcts;
 pub mod mcts_threaded;
 pub mod pokemon;
+pub mod prof;
 pub mod search;
 pub mod state;
 

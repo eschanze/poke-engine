@@ -165,6 +165,7 @@ fn generate_instructions_from_switch(
     switching_side_ref: SideReference,
     incoming_instructions: &mut StateInstructions,
 ) {
+    crate::prof_scope!(crate::prof::sec::GEN_SWITCH);
     let should_last_used_move = state.use_last_used_move;
     state.apply_instructions(&incoming_instructions.instruction_list);
 
@@ -952,7 +953,8 @@ fn compare_health_with_damage_multiples(max_damage: i16, health: i16) -> (i16, i
         if damage < health_f32 {
             total_less_than += damage as i16;
             num_less_than += 1;
-        } else if damage > health_f32 {
+        } else {
+            // damage == health is a kill (hp reaches exactly 0)
             num_greater_than += 1;
         }
         damage += increment;
@@ -969,6 +971,7 @@ fn get_instructions_from_secondaries(
     incoming_instructions: StateInstructions,
     hit_sub: bool,
 ) -> Vec<StateInstructions> {
+    crate::prof_scope!(crate::prof::sec::SECONDARIES);
     let mut return_instruction_list = Vec::with_capacity(4);
     return_instruction_list.push(incoming_instructions);
 
@@ -1119,6 +1122,7 @@ fn check_move_hit_or_miss(
     incoming_instructions: &mut StateInstructions,
     frozen_instructions: &mut Vec<StateInstructions>,
 ) {
+    crate::prof_scope!(crate::prof::sec::HIT_MISS);
     /*
     Checks whether a move can miss
 
@@ -1302,6 +1306,7 @@ fn generate_instructions_from_damage(
     attacking_side_ref: &SideReference,
     mut incoming_instructions: &mut StateInstructions,
 ) -> bool {
+    crate::prof_scope!(crate::prof::sec::FROM_DAMAGE);
     /*
     TODO:
         - arbitrary other after_move as well from the old engine (triggers on hit OR miss)
@@ -1582,6 +1587,7 @@ fn before_move(
     attacking_side: &SideReference,
     incoming_instructions: &mut StateInstructions,
 ) {
+    crate::prof_scope!(crate::prof::sec::BEFORE_MOVE);
     #[cfg(feature = "terastallization")]
     terastallized_base_power_floor(state, choice, attacking_side);
 
@@ -1702,6 +1708,7 @@ fn generate_instructions_from_existing_status_conditions(
     incoming_instructions: &mut StateInstructions,
     final_instructions: &mut Vec<StateInstructions>,
 ) {
+    crate::prof_scope!(crate::prof::sec::STATUS_CONDS);
     let (attacking_side, _defending_side) = state.get_both_sides(attacking_side_ref);
     let current_active_index = attacking_side.active_index;
     let attacker_active = attacking_side.get_active();
@@ -1947,6 +1954,7 @@ pub fn generate_instructions_from_move(
     mut final_instructions: &mut Vec<StateInstructions>,
     branch_on_damage: bool,
 ) {
+    crate::prof_scope!(crate::prof::sec::GEN_MOVE);
     if state.use_damage_dealt {
         reset_damage_dealt(
             state.get_side(&attacking_side),
@@ -2266,8 +2274,14 @@ pub fn generate_instructions_from_move(
         final_instructions.push(incoming_instructions);
         return;
     }
-    choice_special_effect(state, choice, &attacking_side, &mut incoming_instructions);
-    let damage = calculate_damage(state, &attacking_side, &choice, DamageRolls::Max);
+    {
+        crate::prof_scope!(crate::prof::sec::SPECIAL_EFFECT);
+        choice_special_effect(state, choice, &attacking_side, &mut incoming_instructions);
+    }
+    let damage = {
+        crate::prof_scope!(crate::prof::sec::CALC_DAMAGE);
+        calculate_damage(state, &attacking_side, &choice, DamageRolls::Max)
+    };
     check_move_hit_or_miss(
         state,
         &choice,
@@ -2419,6 +2433,7 @@ pub fn generate_instructions_from_move(
 }
 
 fn combine_duplicate_instructions(list_of_instructions: &mut Vec<StateInstructions>) {
+    crate::prof_scope!(crate::prof::sec::COMBINE_DUPES);
     for i in 0..list_of_instructions.len() {
         let mut j = i + 1;
         while j < list_of_instructions.len() {
@@ -2534,6 +2549,7 @@ fn moves_first(
     side_two_choice: &Choice,
     incoming_instructions: &mut StateInstructions,
 ) -> SideMovesFirst {
+    crate::prof_scope!(crate::prof::sec::MOVES_FIRST);
     let side_one_effective_speed = get_effective_speed(&state, &SideReference::SideOne);
     let side_two_effective_speed = get_effective_speed(&state, &SideReference::SideTwo);
 
@@ -2764,6 +2780,7 @@ fn add_end_of_turn_instructions(
     mut incoming_instructions: &mut StateInstructions,
     first_move_side: &SideReference,
 ) {
+    crate::prof_scope!(crate::prof::sec::END_OF_TURN);
     if state.side_one.force_switch || state.side_two.force_switch {
         return;
     }
@@ -3530,6 +3547,7 @@ fn run_move(
     defender_choice: &Choice,
     final_instructions: &mut Vec<StateInstructions>,
 ) {
+    crate::prof_scope!(crate::prof::sec::RUN_MOVE);
     let mut hit_sub = false;
     for _ in 0..hit_count {
         if does_damage {
@@ -3732,6 +3750,7 @@ fn run_move(
 }
 
 fn after_move_finish(state: &mut State, final_instructions: &mut Vec<StateInstructions>) {
+    crate::prof_scope!(crate::prof::sec::AFTER_MOVE_FINISH);
     for state_instructions in final_instructions.iter_mut() {
         state.apply_instructions(&state_instructions.instruction_list);
 
