@@ -5,7 +5,7 @@ use crate::engine::generate_instructions::{
 };
 use crate::engine::state::MoveChoice;
 use crate::instruction::{Instruction, StateInstructions};
-use crate::mcts::{perform_mcts, MctsResult};
+use crate::mcts::{perform_mcts, MctsResult, DEFAULT_EXPLORATION_CONSTANT};
 use crate::mcts_threaded::perform_mcts_shared_tree;
 use crate::search::{expectiminimax_search, iterative_deepen_expectiminimax, pick_safest};
 use crate::state::State;
@@ -190,7 +190,7 @@ fn pprint_mcts_result(state: &State, result: MctsResult) {
             "\t{:<25}{:>12.2}{:>12.2}{:>10}{:>10.2}",
             x.move_choice.to_string(&state.side_one),
             x.total_score,
-            x.total_score / x.visits as f32,
+            x.total_score / x.visits as f64,
             x.visits,
             (x.visits as f32 / result.iteration_count as f32) * 100.0
         );
@@ -206,7 +206,7 @@ fn pprint_mcts_result(state: &State, result: MctsResult) {
             "\t{:<25}{:>12.2}{:>12.2}{:>10}{:>10.2}",
             x.move_choice.to_string(&state.side_two),
             x.total_score,
-            x.total_score / x.visits as f32,
+            x.total_score / x.visits as f64,
             x.visits,
             (x.visits as f32 / result.iteration_count as f32) * 100.0
         );
@@ -307,6 +307,7 @@ pub fn main() {
                         std::time::Duration::from_millis(mcts.time_to_search_ms),
                         mcts.iterations,
                         mcts.threads,
+                        DEFAULT_EXPLORATION_CONSTANT,
                     )
                 } else {
                     perform_mcts(
@@ -315,6 +316,7 @@ pub fn main() {
                         side_two_options.clone(),
                         std::time::Duration::from_millis(mcts.time_to_search_ms),
                         mcts.iterations,
+                        DEFAULT_EXPLORATION_CONSTANT,
                     )
                 };
                 print_mcts_result(&state, result);
@@ -581,6 +583,7 @@ fn command_loop(mut io_data: IOData) {
                         side_two_options.clone(),
                         std::time::Duration::from_millis(max_time_ms),
                         0,
+                        DEFAULT_EXPLORATION_CONSTANT,
                     );
                     let elapsed = start_time.elapsed();
                     pprint_mcts_result(&io_data.state, result);
@@ -620,6 +623,7 @@ fn command_loop(mut io_data: IOData) {
                     std::time::Duration::from_millis(max_time_ms),
                     0,
                     worker_count,
+                    DEFAULT_EXPLORATION_CONSTANT,
                 );
                 let elapsed = start_time.elapsed();
                 pprint_mcts_result(&io_data.state, result);

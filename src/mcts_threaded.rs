@@ -1,21 +1,32 @@
 use crate::engine::evaluate::evaluate;
 use crate::engine::generate_instructions::generate_instructions_from_move_pair;
 use crate::engine::state::MoveChoice;
-use crate::instruction::StateInstructions;
-use crate::mcts::{MctsResult, MctsSideResult};
+use crate::instruction::{Instruction, StateInstructions};
+use crate::mcts::{
+    MctsResult, MctsSideResult, MCTS_BRANCH_ENTRY_OVERHEAD, MCTS_MAX_TREE_BYTES, MCTS_NODE_OVERHEAD,
+};
 use crate::state::State;
 use dashmap::DashMap;
 use rand::prelude::*;
-use rand::rng;
-use std::sync::atomic::{AtomicI8, AtomicU32, Ordering};
+use rand::rngs::SmallRng;
+use std::sync::atomic::{AtomicI8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const MCTS_MAX_ITERATIONS_PER_TREE: u32 = 10_000_000;
 const MCTS_DAMAGE_BRANCH_DEPTH: u8 = 2;
 const SCORE_SCALE: f32 = 400.0;
-const VIRTUAL_LOSS_VISITS: u32 = 3;
+const VIRTUAL_LOSS_VISITS: u64 = 3;
+
+fn approx_branch_bytes(nodes: &[Node]) -> u64 {
+    let instr_bytes: usize = nodes
+        .iter()
+        .map(|n| n.instructions.instruction_list.capacity() * std::mem::size_of::<Instruction>())
+        .sum();
+    (MCTS_BRANCH_ENTRY_OVERHEAD
+        + nodes.len() * (std::mem::size_of::<Node>() + MCTS_NODE_OVERHEAD)
+        + instr_bytes) as u64
+}
 
 // Node map type alias for clarity.
 // key: (parent node address, s1_move_index, s2_move_index)
@@ -29,16 +40,16 @@ fn sigmoid(x: f32) -> f32 {
 
 pub struct MoveNode {
     move_choice: MoveChoice,
-    total_score: AtomicU32,
-    visits: AtomicU32,
+    total_score: AtomicU64,
+    visits: AtomicU64,
 }
 
 impl MoveNode {
     fn new(move_choice: MoveChoice) -> Self {
         Self {
             move_choice,
-            total_score: AtomicU32::new(0),
-            visits: AtomicU32::new(0),
+            total_score: AtomicU64::new(0),
+            visits: AtomicU64::new(0),
         }
     }
 
@@ -52,21 +63,22 @@ impl MoveNode {
 
     fn add_result(&self, score: f32) {
         self.total_score
-            .fetch_add((score * SCORE_SCALE).round() as u32, Ordering::AcqRel);
+            .fetch_add((score * SCORE_SCALE).round() as u64, Ordering::AcqRel);
         self.visits.fetch_add(1, Ordering::AcqRel);
     }
 
-    fn total_score_f32(&self) -> f32 {
-        self.total_score.load(Ordering::Acquire) as f32 / SCORE_SCALE
+    fn total_score_f64(&self) -> f64 {
+        self.total_score.load(Ordering::Acquire) as f64 / SCORE_SCALE as f64
     }
 
-    fn ucb1(&self, parent_visits: u32) -> f32 {
+    // exploration_sq is c^2: the formula is avg + sqrt(c^2 * ln(N) / n)
+    fn ucb1_with_ln(&self, ln_parent_visits: f32, exploration_sq: f32) -> f32 {
         let visits = self.visits.load(Ordering::Acquire);
         if visits == 0 {
             return f32::INFINITY;
         }
-        let average_score = self.total_score_f32() / visits as f32;
-        let exploration = 2.0 * (parent_visits as f32).ln().max(0.0) / visits as f32;
+        let average_score = (self.total_score_f64() / visits as f64) as f32;
+        let exploration = exploration_sq * ln_parent_visits / visits as f32;
         average_score + exploration.sqrt()
     }
 }
@@ -117,7 +129,7 @@ pub struct Node {
     root: bool,
     instructions: StateInstructions,
     depth: u8,
-    times_visited: AtomicU32,
+    times_visited: AtomicU64,
     virtual_losses: AtomicI8,
     options: OnceLock<SharedNodeOptions>,
 }
@@ -128,7 +140,7 @@ impl Node {
             root: true,
             instructions: StateInstructions::default(),
             depth: 0,
-            times_visited: AtomicU32::new(0),
+            times_visited: AtomicU64::new(0),
             virtual_losses: AtomicI8::new(0),
             options: OnceLock::new(),
         });
@@ -143,7 +155,7 @@ impl Node {
             root: false,
             instructions,
             depth,
-            times_visited: AtomicU32::new(0),
+            times_visited: AtomicU64::new(0),
             virtual_losses: AtomicI8::new(0),
             options: OnceLock::new(),
         }
@@ -160,16 +172,16 @@ impl Node {
         })
     }
 
-    fn select_move_pair(&self, state: &State) -> (usize, usize) {
+    fn select_move_pair(&self, state: &State, exploration_sq: f32) -> (usize, usize) {
         let options = self.ensure_options(state);
         let parent_visits = self
             .times_visited
             .load(Ordering::Acquire)
-            .saturating_add(self.virtual_losses.load(Ordering::Acquire).max(0) as u32)
+            .saturating_add(self.virtual_losses.load(Ordering::Acquire).max(0) as u64)
             .max(1);
         (
-            self.maximize_ucb_for_side(&options.s1, parent_visits),
-            self.maximize_ucb_for_side(&options.s2, parent_visits),
+            self.maximize_ucb_for_side(&options.s1, parent_visits, exploration_sq),
+            self.maximize_ucb_for_side(&options.s2, parent_visits, exploration_sq),
         )
     }
 
@@ -179,6 +191,7 @@ impl Node {
         rng: &mut R,
         children: &ChildMap,
         path: &mut Vec<PathStep>,
+        exploration_sq: f32,
     ) -> (*const Node, usize, usize) {
         // raw pointers walk both the root (a standalone Arc<Node>) and children
         // (Nodes living inside a branch's Arc<[Node]>) uniformly. every node is
@@ -187,7 +200,7 @@ impl Node {
         let mut current: *const Node = Arc::as_ptr(root);
         loop {
             let node = unsafe { &*current };
-            let (s1_index, s2_index) = node.select_move_pair(state);
+            let (s1_index, s2_index) = node.select_move_pair(state, exploration_sq);
             let options = node.options.get().expect("options set during selection");
 
             let key = (node.as_key(), s1_index, s2_index);
@@ -222,17 +235,26 @@ impl Node {
         }
     }
 
-    fn maximize_ucb_for_side(&self, side_options: &[MoveNode], parent_visits: u32) -> usize {
-        side_options
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| {
-                a.ucb1(parent_visits)
-                    .partial_cmp(&b.ucb1(parent_visits))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|(i, _)| i)
-            .unwrap_or(0)
+    fn maximize_ucb_for_side(
+        &self,
+        side_options: &[MoveNode],
+        parent_visits: u64,
+        exploration_sq: f32,
+    ) -> usize {
+        // ln(parent_visits) is the same for every option; compute it once.
+        // a manual loop also evaluates each option's ucb1 exactly once,
+        // unlike max_by which re-evaluates the running max per comparison
+        let ln_parent_visits = (parent_visits as f32).ln().max(0.0);
+        let mut choice = 0;
+        let mut best_ucb1 = f32::MIN;
+        for (index, node) in side_options.iter().enumerate() {
+            let this_ucb1 = node.ucb1_with_ln(ln_parent_visits, exploration_sq);
+            if this_ucb1 > best_ucb1 {
+                best_ucb1 = this_ucb1;
+                choice = index;
+            }
+        }
+        choice
     }
 
     /// looks up or creates the child branch for `(s1_index, s2_index)` and
@@ -245,6 +267,7 @@ impl Node {
         s2_index: usize,
         rng: &mut R,
         children: &ChildMap,
+        tree_bytes: &AtomicU64,
     ) -> Option<*const Node> {
         let options = self
             .options
@@ -279,7 +302,14 @@ impl Node {
         let key = (self.as_key(), s1_index, s2_index);
         // entry() on DashMap is atomic per-shard: only one thread will
         // construct the branch; all others get the winner's branch.
-        let branch_ref = children.entry(key).or_insert(branch);
+        // only the winner's branch counts toward the memory estimate
+        let branch_ref = match children.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => entry.into_ref(),
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                tree_bytes.fetch_add(approx_branch_bytes(&branch.nodes), Ordering::Relaxed);
+                entry.insert(branch)
+            }
+        };
 
         Some(branch_ref.sample(rng))
     }
@@ -322,16 +352,19 @@ fn mcts_iteration<R: Rng + ?Sized>(
     rng: &mut R,
     children: &ChildMap,
     path: &mut Vec<PathStep>,
+    tree_bytes: &AtomicU64,
+    exploration_sq: f32,
 ) {
     path.clear();
 
-    let (leaf, s1_index, s2_index) = Node::selection(root, state, rng, children, path);
+    let (leaf, s1_index, s2_index) =
+        Node::selection(root, state, rng, children, path, exploration_sq);
     let leaf = unsafe { &*leaf };
 
     let options = leaf.options.get().expect("options set during selection");
     options.s1[s1_index].add_virtual_loss();
     options.s2[s2_index].add_virtual_loss();
-    let expanded = leaf.expand(state, s1_index, s2_index, rng, children);
+    let expanded = leaf.expand(state, s1_index, s2_index, rng, children, tree_bytes);
     match expanded {
         Some(child) => {
             let child = unsafe { &*child };
@@ -365,9 +398,11 @@ fn mcts_iteration<R: Rng + ?Sized>(
     }
 }
 
+#[derive(Clone, Copy)]
 enum SearchLimit {
     Time,
     Iterations(u32),
+    TimeOrIterations(u32),
 }
 
 fn run_mcts_loop(
@@ -375,11 +410,15 @@ fn run_mcts_loop(
     root_eval: f32,
     children: Arc<ChildMap>,
     worker_state: &mut State,
-    started_iterations: Arc<AtomicU32>,
+    started_iterations: Arc<AtomicU64>,
+    tree_bytes: Arc<AtomicU64>,
     deadline: Instant,
     search_limit: SearchLimit,
+    exploration_sq: f32,
 ) {
-    let mut rng = rng();
+    // SmallRng is much cheaper than the default crypto-grade ThreadRng and
+    // statistical quality is all that matters here
+    let mut rng = SmallRng::from_os_rng();
     let mut path = Vec::with_capacity(16);
     let mut current_iterations = started_iterations.load(Ordering::Acquire);
     loop {
@@ -391,10 +430,12 @@ fn run_mcts_loop(
                 &mut rng,
                 &children,
                 &mut path,
+                &tree_bytes,
+                exploration_sq,
             );
             current_iterations = started_iterations.fetch_add(1, Ordering::AcqRel);
         }
-        if current_iterations >= MCTS_MAX_ITERATIONS_PER_TREE {
+        if tree_bytes.load(Ordering::Relaxed) >= MCTS_MAX_TREE_BYTES {
             break;
         }
         match search_limit {
@@ -404,7 +445,12 @@ fn run_mcts_loop(
                 }
             }
             SearchLimit::Iterations(max_iterations) => {
-                if current_iterations >= max_iterations {
+                if current_iterations >= max_iterations as u64 {
+                    break;
+                }
+            }
+            SearchLimit::TimeOrIterations(max_iterations) => {
+                if Instant::now() >= deadline || current_iterations >= max_iterations as u64 {
                     break;
                 }
             }
@@ -419,11 +465,14 @@ pub fn perform_mcts_shared_tree(
     max_time: Duration,
     max_iterations: u32,
     worker_count: usize,
+    exploration_constant: f32,
 ) -> MctsResult {
+    let exploration_sq = exploration_constant * exploration_constant;
     let root_eval = evaluate(state);
     let deadline = Instant::now() + max_time;
     let root = Node::new_root(side_one_options, side_two_options);
-    let started_iterations = Arc::new(AtomicU32::new(0));
+    let started_iterations = Arc::new(AtomicU64::new(0));
+    let tree_bytes = Arc::new(AtomicU64::new(0));
 
     // global map shared by all threads.
     let children: Arc<ChildMap> = Arc::new(DashMap::with_capacity(1 << 16));
@@ -432,9 +481,12 @@ pub fn perform_mcts_shared_tree(
         for _ in 0..worker_count {
             let root = root.clone();
             let started_iterations = started_iterations.clone();
+            let tree_bytes = tree_bytes.clone();
             let children = children.clone();
             let mut worker_state = state.clone();
-            let search_limit = if max_iterations > 0 {
+            let search_limit = if max_iterations > 0 && max_time > Duration::from_millis(0) {
+                SearchLimit::TimeOrIterations(max_iterations)
+            } else if max_iterations > 0 {
                 SearchLimit::Iterations(max_iterations)
             } else {
                 SearchLimit::Time
@@ -446,8 +498,10 @@ pub fn perform_mcts_shared_tree(
                     children,
                     &mut worker_state,
                     started_iterations,
+                    tree_bytes,
                     deadline,
                     search_limit,
+                    exploration_sq,
                 );
             });
         }
@@ -460,7 +514,7 @@ pub fn perform_mcts_shared_tree(
             .iter()
             .map(|v| MctsSideResult {
                 move_choice: v.move_choice,
-                total_score: v.total_score_f32(),
+                total_score: v.total_score_f64(),
                 visits: v.visits.load(Ordering::Acquire),
             })
             .collect(),
@@ -469,7 +523,7 @@ pub fn perform_mcts_shared_tree(
             .iter()
             .map(|v| MctsSideResult {
                 move_choice: v.move_choice,
-                total_score: v.total_score_f32(),
+                total_score: v.total_score_f64(),
                 visits: v.visits.load(Ordering::Acquire),
             })
             .collect(),

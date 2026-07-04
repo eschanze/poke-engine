@@ -19,13 +19,17 @@ path = "src/main.rs"
 name = "benchmark"
 path = "data/benchmark.rs"
 
+[[bin]]
+name = "selfplay"
+path = "data/selfplay.rs"
+
 [profile.release]
 debug = 1
 
 [dependencies]
 dashmap = "6.1.0"
 clap = { version = "4.5.4", features = ["derive"] }
-rand = "0.9.3"
+rand = { version = "0.9.3", features = ["small_rng"] }
 
 [features]
 remove_low_chance_instructions = []

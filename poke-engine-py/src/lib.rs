@@ -11,7 +11,7 @@ use poke_engine::engine::generate_instructions::{
 use poke_engine::engine::items::Items;
 use poke_engine::engine::state::{MoveChoice, PokemonVolatileStatus, Terrain, Weather};
 use poke_engine::instruction::{Instruction, StateInstructions};
-use poke_engine::mcts::{perform_mcts, MctsResult, MctsSideResult};
+use poke_engine::mcts::{perform_mcts, MctsResult, MctsSideResult, DEFAULT_EXPLORATION_CONSTANT};
 use poke_engine::mcts_threaded::perform_mcts_shared_tree;
 use poke_engine::pokemon::PokemonName;
 use poke_engine::search::iterative_deepen_expectiminimax;
@@ -849,8 +849,8 @@ impl PyMove {
 #[pyclass(get_all, from_py_object)]
 struct PyMctsSideResult {
     pub move_choice: String,
-    pub total_score: f32,
-    pub visits: u32,
+    pub total_score: f64,
+    pub visits: u64,
 }
 
 impl PyMctsSideResult {
@@ -868,7 +868,7 @@ impl PyMctsSideResult {
 struct PyMctsResult {
     s1: Vec<PyMctsSideResult>,
     s2: Vec<PyMctsSideResult>,
-    iteration_count: u32,
+    iteration_count: u64,
 }
 
 impl PyMctsResult {
@@ -932,10 +932,23 @@ fn mcts(
     let (s1_options, s2_options) = state.root_get_all_options();
     let mcts_result = if threads > 1 {
         perform_mcts_shared_tree(
-            &mut state, s1_options, s2_options, duration, iterations, threads,
+            &mut state,
+            s1_options,
+            s2_options,
+            duration,
+            iterations,
+            threads,
+            DEFAULT_EXPLORATION_CONSTANT,
         )
     } else {
-        perform_mcts(&mut state, s1_options, s2_options, duration, iterations)
+        perform_mcts(
+            &mut state,
+            s1_options,
+            s2_options,
+            duration,
+            iterations,
+            DEFAULT_EXPLORATION_CONSTANT,
+        )
     };
 
     let py_mcts_result = PyMctsResult::from_mcts_result(mcts_result, &state);

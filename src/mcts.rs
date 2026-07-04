@@ -1,12 +1,38 @@
 use crate::engine::evaluate::evaluate;
 use crate::engine::generate_instructions::generate_instructions_from_move_pair;
 use crate::engine::state::MoveChoice;
-use crate::instruction::StateInstructions;
+use crate::instruction::{Instruction, StateInstructions};
 use crate::state::State;
 use rand::prelude::*;
-use rand::rng;
+use rand::rngs::SmallRng;
 use std::collections::HashMap;
 use std::time::Duration;
+
+// UCB1 exploration constant c in `avg + c * sqrt(ln(N) / n)`.
+// Tuned by self-play (2026-07-03, see WORKLOG.md): 0.5 beats the classical
+// sqrt(2) by ~+87 Elo at 20k iterations and ~+108 Elo at 100ms/12-thread
+// searches; 0.3 and 0.75 measured slightly worse than 0.5.
+pub const DEFAULT_EXPLORATION_CONSTANT: f32 = 0.5;
+
+// Approximate cap on tree memory, replacing the old fixed 10M iteration cap.
+// The estimate under-counts allocator overhead, so keep some headroom below
+// physical RAM.
+pub(crate) const MCTS_MAX_TREE_BYTES: u64 = 24 * 1024 * 1024 * 1024;
+
+// rough per-branch estimate: map entry overhead + node structs + instruction
+// heap allocations. per-node constant absorbs options vecs and allocator slack
+pub(crate) const MCTS_BRANCH_ENTRY_OVERHEAD: usize = 64;
+pub(crate) const MCTS_NODE_OVERHEAD: usize = 256;
+
+fn approx_branch_bytes(nodes: &[Node]) -> u64 {
+    let instr_bytes: usize = nodes
+        .iter()
+        .map(|n| n.instructions.instruction_list.capacity() * std::mem::size_of::<Instruction>())
+        .sum();
+    (MCTS_BRANCH_ENTRY_OVERHEAD
+        + nodes.len() * (std::mem::size_of::<Node>() + MCTS_NODE_OVERHEAD)
+        + instr_bytes) as u64
+}
 
 fn sigmoid(x: f32) -> f32 {
     // Tuned so that ~200 points is very close to 1.0
@@ -17,7 +43,7 @@ fn sigmoid(x: f32) -> f32 {
 pub struct Node {
     pub root: bool,
     pub parent: *mut Node,
-    pub times_visited: u32,
+    pub times_visited: u64,
 
     // represents the instructions & s1/s2 moves that led to this node from the parent
     pub instructions: StateInstructions,
@@ -65,11 +91,13 @@ impl Node {
         self.s2_options = Some(s2_options_vec);
     }
 
-    pub fn maximize_ucb_for_side(&self, side_map: &[MoveNode]) -> usize {
+    pub fn maximize_ucb_for_side(&self, side_map: &[MoveNode], exploration_sq: f32) -> usize {
+        // ln(parent_visits) is the same for every option; compute it once
+        let ln_parent_visits = (self.times_visited as f32).ln();
         let mut choice = 0;
         let mut best_ucb1 = f32::MIN;
         for (index, node) in side_map.iter().enumerate() {
-            let this_ucb1 = node.ucb1(self.times_visited);
+            let this_ucb1 = node.ucb1_with_ln(ln_parent_visits, exploration_sq);
             if this_ucb1 > best_ucb1 {
                 best_ucb1 = this_ucb1;
                 choice = index;
@@ -83,21 +111,24 @@ impl Node {
         state: &mut State,
         children: &mut HashMap<(usize, usize, usize), Box<[Node]>>,
         rng: &mut impl Rng,
+        exploration_sq: f32,
     ) -> (*mut Node, usize, usize) {
         if self.s1_options.is_none() {
             let (s1_options, s2_options) = state.get_all_options();
             self.populate(s1_options, s2_options);
         }
 
-        let s1_mc_index = self.maximize_ucb_for_side(self.s1_options.as_ref().unwrap());
-        let s2_mc_index = self.maximize_ucb_for_side(self.s2_options.as_ref().unwrap());
+        let s1_mc_index =
+            self.maximize_ucb_for_side(self.s1_options.as_ref().unwrap(), exploration_sq);
+        let s2_mc_index =
+            self.maximize_ucb_for_side(self.s2_options.as_ref().unwrap(), exploration_sq);
         let key = (self as *mut Node as usize, s1_mc_index, s2_mc_index);
         match children.get_mut(&key) {
             Some(child_vector) => {
                 let child_vec_ptr = child_vector as *mut Box<[Node]>;
                 let chosen_child = self.sample_node(child_vec_ptr, rng);
                 state.apply_instructions(&(*chosen_child).instructions.instruction_list);
-                (*chosen_child).selection(state, children, rng)
+                (*chosen_child).selection(state, children, rng, exploration_sq)
             }
             None => (self as *mut Node, s1_mc_index, s2_mc_index),
         }
@@ -131,6 +162,7 @@ impl Node {
         s2_move_index: usize,
         children: &mut HashMap<(usize, usize, usize), Box<[Node]>>,
         rng: &mut impl Rng,
+        tree_bytes: &mut u64,
     ) -> *mut Node {
         let s1_move = &self.s1_options.as_ref().unwrap()[s1_move_index].move_choice;
         let s2_move = &self.s2_options.as_ref().unwrap()[s2_move_index].move_choice;
@@ -163,6 +195,7 @@ impl Node {
         state.apply_instructions(&(*new_node_ptr).instructions.instruction_list);
 
         let key = (self as *mut Node as usize, s1_move_index, s2_move_index);
+        *tree_bytes += approx_branch_bytes(&boxed);
         children.insert(key, boxed);
         new_node_ptr
     }
@@ -175,12 +208,12 @@ impl Node {
 
         let parent_s1_movenode =
             &mut (*self.parent).s1_options.as_mut().unwrap()[self.s1_choice as usize];
-        parent_s1_movenode.total_score += score;
+        parent_s1_movenode.total_score += score as f64;
         parent_s1_movenode.visits += 1;
 
         let parent_s2_movenode =
             &mut (*self.parent).s2_options.as_mut().unwrap()[self.s2_choice as usize];
-        parent_s2_movenode.total_score += 1.0 - score;
+        parent_s2_movenode.total_score += (1.0 - score) as f64;
         parent_s2_movenode.visits += 1;
 
         state.reverse_instructions(&self.instructions.instruction_list);
@@ -205,21 +238,28 @@ impl Node {
 #[derive(Debug)]
 pub struct MoveNode {
     pub move_choice: MoveChoice,
-    pub total_score: f32,
-    pub visits: u32,
+    pub total_score: f64,
+    pub visits: u64,
 }
 
 impl MoveNode {
-    pub fn ucb1(&self, parent_visits: u32) -> f32 {
+    // exploration_sq is c^2: the formula is avg + sqrt(c^2 * ln(N) / n)
+    fn ucb1_with_ln(&self, ln_parent_visits: f32, exploration_sq: f32) -> f32 {
         if self.visits == 0 {
             return f32::INFINITY;
         }
-        let score = (self.total_score / self.visits as f32)
-            + (2.0 * (parent_visits as f32).ln() / self.visits as f32).sqrt();
+        let score = (self.total_score / self.visits as f64) as f32
+            + (exploration_sq * ln_parent_visits / self.visits as f32).sqrt();
         score
     }
+    pub fn ucb1(&self, parent_visits: u64) -> f32 {
+        self.ucb1_with_ln(
+            (parent_visits as f32).ln(),
+            DEFAULT_EXPLORATION_CONSTANT * DEFAULT_EXPLORATION_CONSTANT,
+        )
+    }
     pub fn average_score(&self) -> f32 {
-        let score = self.total_score / self.visits as f32;
+        let score = (self.total_score / self.visits as f64) as f32;
         score
     }
 }
@@ -227,8 +267,8 @@ impl MoveNode {
 #[derive(Clone)]
 pub struct MctsSideResult {
     pub move_choice: MoveChoice,
-    pub total_score: f32,
-    pub visits: u32,
+    pub total_score: f64,
+    pub visits: u64,
 }
 
 impl MctsSideResult {
@@ -236,7 +276,7 @@ impl MctsSideResult {
         if self.visits == 0 {
             return 0.0;
         }
-        let score = self.total_score / self.visits as f32;
+        let score = (self.total_score / self.visits as f64) as f32;
         score
     }
 }
@@ -244,7 +284,7 @@ impl MctsSideResult {
 pub struct MctsResult {
     pub s1: Vec<MctsSideResult>,
     pub s2: Vec<MctsSideResult>,
-    pub iteration_count: u32,
+    pub iteration_count: u64,
 }
 
 fn mcts_iteration(
@@ -253,16 +293,21 @@ fn mcts_iteration(
     root_eval: &f32,
     children: &mut HashMap<(usize, usize, usize), Box<[Node]>>,
     rng: &mut impl Rng,
+    tree_bytes: &mut u64,
+    exploration_sq: f32,
 ) {
-    let (mut new_node, s1_move, s2_move) = unsafe { root_node.selection(state, children, rng) };
-    new_node = unsafe { (*new_node).expand(state, s1_move, s2_move, children, rng) };
+    let (mut new_node, s1_move, s2_move) =
+        unsafe { root_node.selection(state, children, rng, exploration_sq) };
+    new_node = unsafe { (*new_node).expand(state, s1_move, s2_move, children, rng, tree_bytes) };
     let rollout_result = unsafe { (*new_node).rollout(state, root_eval) };
     unsafe { (*new_node).backpropagate(rollout_result, state) }
 }
 
+#[derive(Clone, Copy)]
 enum SearchLimit {
     Time(Duration),
     Iterations(u32),
+    TimeOrIterations(Duration, u32),
 }
 
 fn run_mcts_loop(
@@ -271,14 +316,26 @@ fn run_mcts_loop(
     root_eval: &f32,
     children: &mut HashMap<(usize, usize, usize), Box<[Node]>>,
     limit: SearchLimit,
+    exploration_sq: f32,
 ) {
-    let mut rng = rng();
+    // SmallRng is much cheaper than the default crypto-grade ThreadRng and
+    // statistical quality is all that matters here
+    let mut rng = SmallRng::from_os_rng();
     let start_time = std::time::Instant::now();
+    let mut tree_bytes: u64 = 0;
     loop {
         for _ in 0..1000 {
-            mcts_iteration(root_node, state, root_eval, children, &mut rng);
+            mcts_iteration(
+                root_node,
+                state,
+                root_eval,
+                children,
+                &mut rng,
+                &mut tree_bytes,
+                exploration_sq,
+            );
         }
-        if root_node.times_visited >= 10_000_000 {
+        if tree_bytes >= MCTS_MAX_TREE_BYTES {
             break;
         }
         match limit {
@@ -288,7 +345,12 @@ fn run_mcts_loop(
                 }
             }
             SearchLimit::Iterations(n) => {
-                if root_node.times_visited >= n {
+                if root_node.times_visited >= n as u64 {
+                    break;
+                }
+            }
+            SearchLimit::TimeOrIterations(max_time, n) => {
+                if start_time.elapsed() >= max_time || root_node.times_visited >= n as u64 {
                     break;
                 }
             }
@@ -302,6 +364,7 @@ pub fn perform_mcts(
     side_two_options: Vec<MoveChoice>,
     max_time: Duration,
     max_iterations: u32,
+    exploration_constant: f32,
 ) -> MctsResult {
     let mut root_node = Node::new();
     unsafe {
@@ -311,7 +374,9 @@ pub fn perform_mcts(
     let mut children: HashMap<(usize, usize, usize), Box<[Node]>> = HashMap::new();
 
     let root_eval = evaluate(state);
-    let search_limit = if max_iterations > 0 {
+    let search_limit = if max_iterations > 0 && max_time > Duration::from_millis(0) {
+        SearchLimit::TimeOrIterations(max_time, max_iterations)
+    } else if max_iterations > 0 {
         SearchLimit::Iterations(max_iterations)
     } else {
         SearchLimit::Time(max_time)
@@ -322,6 +387,7 @@ pub fn perform_mcts(
         &root_eval,
         &mut children,
         search_limit,
+        exploration_constant * exploration_constant,
     );
 
     let result = MctsResult {

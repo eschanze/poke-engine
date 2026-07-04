@@ -5,3 +5,6 @@
 *.so
 **__pycache**
 poke-engine-py/docs/build/
+CONTEXT.md
+SELFPLAY_PLAN.md
+WORKLOG.md
