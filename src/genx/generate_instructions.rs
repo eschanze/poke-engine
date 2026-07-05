@@ -3752,28 +3752,167 @@ fn run_move(
 fn after_move_finish(state: &mut State, final_instructions: &mut Vec<StateInstructions>) {
     crate::prof_scope!(crate::prof::sec::AFTER_MOVE_FINISH);
     for state_instructions in final_instructions.iter_mut() {
-        state.apply_instructions(&state_instructions.instruction_list);
+        apply_white_herb_after_move(state, state_instructions, SideReference::SideOne);
+        apply_white_herb_after_move(state, state_instructions, SideReference::SideTwo);
+    }
+}
 
-        // check if anybody has negative boosts and a whiteherb
-        // if so, consume the item and set the boosts to 0
-        for side_ref in [SideReference::SideOne, SideReference::SideTwo] {
-            let side = state.get_side(&side_ref);
-            let active_has_whiteherb = side.get_active_immutable().item == Items::WHITEHERB;
-            if active_has_whiteherb {
-                if side.reset_negative_boosts(side_ref, state_instructions) {
-                    let active = side.get_active();
-                    active.item = Items::NONE;
-                    state_instructions
-                        .instruction_list
-                        .push(Instruction::ChangeItem(ChangeItemInstruction {
-                            side_ref,
-                            current_item: Items::WHITEHERB,
-                            new_item: Items::NONE,
-                        }));
-                }
-            }
+#[derive(Clone, Copy)]
+struct SideBoosts {
+    attack: i8,
+    defense: i8,
+    special_attack: i8,
+    special_defense: i8,
+    speed: i8,
+    accuracy: i8,
+    evasion: i8,
+}
+
+impl SideBoosts {
+    fn from_side(side: &Side) -> Self {
+        Self {
+            attack: side.attack_boost,
+            defense: side.defense_boost,
+            special_attack: side.special_attack_boost,
+            special_defense: side.special_defense_boost,
+            speed: side.speed_boost,
+            accuracy: side.accuracy_boost,
+            evasion: side.evasion_boost,
         }
-        state.reverse_instructions(&state_instructions.instruction_list);
+    }
+
+    fn apply_boost(&mut self, stat: PokemonBoostableStat, amount: i8) {
+        match stat {
+            PokemonBoostableStat::Attack => self.attack += amount,
+            PokemonBoostableStat::Defense => self.defense += amount,
+            PokemonBoostableStat::SpecialAttack => self.special_attack += amount,
+            PokemonBoostableStat::SpecialDefense => self.special_defense += amount,
+            PokemonBoostableStat::Speed => self.speed += amount,
+            PokemonBoostableStat::Accuracy => self.accuracy += amount,
+            PokemonBoostableStat::Evasion => self.evasion += amount,
+        }
+    }
+
+    fn push_negative_resets(
+        &self,
+        side_ref: SideReference,
+        instructions: &mut Vec<Instruction>,
+    ) -> bool {
+        let mut changed = false;
+        push_negative_boost_reset(
+            instructions,
+            side_ref,
+            PokemonBoostableStat::Attack,
+            self.attack,
+            &mut changed,
+        );
+        push_negative_boost_reset(
+            instructions,
+            side_ref,
+            PokemonBoostableStat::Defense,
+            self.defense,
+            &mut changed,
+        );
+        push_negative_boost_reset(
+            instructions,
+            side_ref,
+            PokemonBoostableStat::SpecialAttack,
+            self.special_attack,
+            &mut changed,
+        );
+        push_negative_boost_reset(
+            instructions,
+            side_ref,
+            PokemonBoostableStat::SpecialDefense,
+            self.special_defense,
+            &mut changed,
+        );
+        push_negative_boost_reset(
+            instructions,
+            side_ref,
+            PokemonBoostableStat::Speed,
+            self.speed,
+            &mut changed,
+        );
+        push_negative_boost_reset(
+            instructions,
+            side_ref,
+            PokemonBoostableStat::Accuracy,
+            self.accuracy,
+            &mut changed,
+        );
+        push_negative_boost_reset(
+            instructions,
+            side_ref,
+            PokemonBoostableStat::Evasion,
+            self.evasion,
+            &mut changed,
+        );
+        changed
+    }
+}
+
+fn push_negative_boost_reset(
+    instructions: &mut Vec<Instruction>,
+    side_ref: SideReference,
+    stat: PokemonBoostableStat,
+    boost: i8,
+    changed: &mut bool,
+) {
+    if boost < 0 {
+        instructions.push(Instruction::Boost(BoostInstruction {
+            side_ref,
+            stat,
+            amount: -boost,
+        }));
+        *changed = true;
+    }
+}
+
+fn apply_white_herb_after_move(
+    state: &State,
+    state_instructions: &mut StateInstructions,
+    side_ref: SideReference,
+) {
+    let side = state.get_side_immutable(&side_ref);
+    let mut boosts = SideBoosts::from_side(side);
+    let mut active_index = side.active_index;
+    let mut items = [
+        side.pokemon.pkmn[0].item,
+        side.pokemon.pkmn[1].item,
+        side.pokemon.pkmn[2].item,
+        side.pokemon.pkmn[3].item,
+        side.pokemon.pkmn[4].item,
+        side.pokemon.pkmn[5].item,
+    ];
+
+    for instruction in &state_instructions.instruction_list {
+        match instruction {
+            Instruction::Boost(boost) if boost.side_ref == side_ref => {
+                boosts.apply_boost(boost.stat, boost.amount);
+            }
+            Instruction::Switch(switch) if switch.side_ref == side_ref => {
+                active_index = switch.next_index;
+            }
+            Instruction::ChangeItem(item) if item.side_ref == side_ref => {
+                items[active_index as usize] = item.new_item;
+            }
+            _ => {}
+        }
+    }
+
+    if items[active_index as usize] != Items::WHITEHERB {
+        return;
+    }
+
+    if boosts.push_negative_resets(side_ref, &mut state_instructions.instruction_list) {
+        state_instructions
+            .instruction_list
+            .push(Instruction::ChangeItem(ChangeItemInstruction {
+                side_ref,
+                current_item: Items::WHITEHERB,
+                new_item: Items::NONE,
+            }));
     }
 }
 

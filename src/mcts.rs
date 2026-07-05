@@ -33,6 +33,28 @@ pub(crate) const MCTS_MAX_TREE_BYTES: u64 = 24 * 1024 * 1024 * 1024;
 // heap allocations. per-node constant absorbs options vecs and allocator slack
 pub(crate) const MCTS_BRANCH_ENTRY_OVERHEAD: usize = 64;
 pub(crate) const MCTS_NODE_OVERHEAD: usize = 256;
+pub(crate) const TERMINAL_UNKNOWN: i8 = 0;
+pub(crate) const TERMINAL_SIDE_ONE_WIN: i8 = 1;
+pub(crate) const TERMINAL_SIDE_TWO_WIN: i8 = -1;
+pub(crate) const TERMINAL_NONTERMINAL: i8 = 2;
+
+pub(crate) fn terminal_result_from_battle_result(result: f32) -> i8 {
+    if result == 0.0 {
+        TERMINAL_NONTERMINAL
+    } else if result == -1.0 {
+        TERMINAL_SIDE_TWO_WIN
+    } else {
+        TERMINAL_SIDE_ONE_WIN
+    }
+}
+
+pub(crate) fn terminal_score_from_cached_result(result: i8) -> Option<f32> {
+    match result {
+        TERMINAL_SIDE_ONE_WIN => Some(1.0),
+        TERMINAL_SIDE_TWO_WIN => Some(0.0),
+        _ => None,
+    }
+}
 
 fn approx_branch_bytes(nodes: &[Node]) -> u64 {
     let instr_bytes: usize = nodes
@@ -69,6 +91,11 @@ pub struct Node {
     // branch). A linear scan beats any hash map here: most nodes only ever
     // expand a handful of pairs, and the entries are hot in cache
     pub children: Vec<(u32, Box<[Node]>)>,
+
+    // Cached battle-over state for this node. This avoids repeatedly scanning
+    // teams and, for terminal children, avoids option generation below a battle
+    // that is already over.
+    pub terminal_result: i8,
 }
 
 impl Node {
@@ -83,8 +110,20 @@ impl Node {
             s1_options: None,
             s2_options: None,
             children: Vec::new(),
+            terminal_result: TERMINAL_UNKNOWN,
         }
     }
+
+    fn terminal_score(&mut self, state: &State) -> Option<f32> {
+        if self.root {
+            return None;
+        }
+        if self.terminal_result == TERMINAL_UNKNOWN {
+            self.terminal_result = terminal_result_from_battle_result(state.battle_is_over());
+        }
+        terminal_score_from_cached_result(self.terminal_result)
+    }
+
     unsafe fn populate(&mut self, s1_options: Vec<MoveChoice>, s2_options: Vec<MoveChoice>) {
         let s1_options_vec: Vec<MoveNode> = s1_options
             .iter()
@@ -128,6 +167,10 @@ impl Node {
         rng: &mut impl Rng,
         exploration_sq: f32,
     ) -> (*mut Node, usize, usize) {
+        if self.terminal_score(state).is_some() {
+            return (self as *mut Node, 0, 0);
+        }
+
         if self.s1_options.is_none() {
             crate::prof_scope!(crate::prof::sec::GET_OPTIONS);
             let (s1_options, s2_options) = state.get_all_options();
@@ -178,12 +221,15 @@ impl Node {
         rng: &mut impl Rng,
         tree_bytes: &mut u64,
     ) -> *mut Node {
+        if self.terminal_score(state).is_some() {
+            return self as *mut Node;
+        }
+
         let s1_move = &self.s1_options.as_ref().unwrap()[s1_move_index].move_choice;
         let s2_move = &self.s2_options.as_ref().unwrap()[s2_move_index].move_choice;
-        // if the battle is over or both moves are none there is no need to expand
-        if (state.battle_is_over() != 0.0 && !self.root)
-            || (s1_move == &MoveChoice::None && s2_move == &MoveChoice::None)
-        {
+        // if both moves are none there is no need to expand. terminal (battle
+        // over) non-root nodes were already handled by terminal_score above
+        if s1_move == &MoveChoice::None && s2_move == &MoveChoice::None {
             return self as *mut Node;
         }
         let should_branch_on_damage = self.root
@@ -240,17 +286,18 @@ impl Node {
     }
 
     pub fn rollout(&mut self, state: &mut State, root_eval: &f32) -> f32 {
-        let battle_is_over = state.battle_is_over();
-        if battle_is_over == 0.0 {
-            let eval = evaluate(state);
-            sigmoid(eval - root_eval)
-        } else {
-            if battle_is_over == -1.0 {
-                0.0
-            } else {
-                battle_is_over
+        if self.root {
+            if let Some(score) = terminal_score_from_cached_result(
+                terminal_result_from_battle_result(state.battle_is_over()),
+            ) {
+                return score;
             }
+        } else if let Some(score) = self.terminal_score(state) {
+            return score;
         }
+
+        let eval = evaluate(state);
+        sigmoid(eval - root_eval)
     }
 }
 

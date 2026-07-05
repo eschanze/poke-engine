@@ -3,7 +3,9 @@ use crate::engine::generate_instructions::generate_instructions_from_move_pair;
 use crate::engine::state::MoveChoice;
 use crate::instruction::{Instruction, StateInstructions};
 use crate::mcts::{
-    MctsResult, MctsSideResult, MCTS_BRANCH_ENTRY_OVERHEAD, MCTS_MAX_TREE_BYTES, MCTS_NODE_OVERHEAD,
+    terminal_result_from_battle_result, terminal_score_from_cached_result, MctsResult,
+    MctsSideResult, MCTS_BRANCH_ENTRY_OVERHEAD, MCTS_MAX_TREE_BYTES, MCTS_NODE_OVERHEAD,
+    TERMINAL_UNKNOWN,
 };
 use crate::state::State;
 use dashmap::DashMap;
@@ -132,6 +134,7 @@ pub struct Node {
     depth: u8,
     times_visited: AtomicU64,
     virtual_losses: AtomicI8,
+    terminal_result: AtomicI8,
     options: OnceLock<SharedNodeOptions>,
 }
 
@@ -143,6 +146,7 @@ impl Node {
             depth: 0,
             times_visited: AtomicU64::new(0),
             virtual_losses: AtomicI8::new(0),
+            terminal_result: AtomicI8::new(TERMINAL_UNKNOWN),
             options: OnceLock::new(),
         });
         let _ = node
@@ -158,6 +162,7 @@ impl Node {
             depth,
             times_visited: AtomicU64::new(0),
             virtual_losses: AtomicI8::new(0),
+            terminal_result: AtomicI8::new(TERMINAL_UNKNOWN),
             options: OnceLock::new(),
         }
     }
@@ -171,6 +176,16 @@ impl Node {
             let (s1, s2) = state.get_all_options();
             SharedNodeOptions::new(s1, s2)
         })
+    }
+
+    fn terminal_score(&self, state: &State) -> Option<f32> {
+        let mut terminal_result = self.terminal_result.load(Ordering::Acquire);
+        if terminal_result == TERMINAL_UNKNOWN {
+            terminal_result = terminal_result_from_battle_result(state.battle_is_over());
+            self.terminal_result
+                .store(terminal_result, Ordering::Release);
+        }
+        terminal_score_from_cached_result(terminal_result)
     }
 
     fn select_move_pair(&self, state: &State, exploration_sq: f32) -> (usize, usize) {
@@ -201,6 +216,10 @@ impl Node {
         let mut current: *const Node = Arc::as_ptr(root);
         loop {
             let node = unsafe { &*current };
+            if !node.root && node.terminal_score(state).is_some() {
+                return (current, 0, 0);
+            }
+
             let (s1_index, s2_index) = node.select_move_pair(state, exploration_sq);
             let options = node.options.get().expect("options set during selection");
 
@@ -270,6 +289,12 @@ impl Node {
         children: &ChildMap,
         tree_bytes: &AtomicU64,
     ) -> Option<*const Node> {
+        // the root is exempt so that searching an already-finished battle
+        // still produces move stats (same as the single-threaded searcher)
+        if !self.root && self.terminal_score(state).is_some() {
+            return None;
+        }
+
         let options = self
             .options
             .get()
@@ -277,9 +302,7 @@ impl Node {
         let s1_move = &options.s1[s1_index].move_choice;
         let s2_move = &options.s2[s2_index].move_choice;
 
-        if (state.battle_is_over() != 0.0 && !self.root)
-            || (s1_move == &MoveChoice::None && s2_move == &MoveChoice::None)
-        {
+        if s1_move == &MoveChoice::None && s2_move == &MoveChoice::None {
             return None;
         }
 
@@ -317,13 +340,10 @@ impl Node {
     }
 
     fn rollout(&self, state: &State, root_eval: f32) -> f32 {
-        let battle_is_over = state.battle_is_over();
-        if battle_is_over == 0.0 {
-            sigmoid(evaluate(state) - root_eval)
-        } else if battle_is_over == -1.0 {
-            0.0
+        if let Some(score) = self.terminal_score(state) {
+            score
         } else {
-            battle_is_over
+            sigmoid(evaluate(state) - root_eval)
         }
     }
 
@@ -362,6 +382,13 @@ fn mcts_iteration<R: Rng + ?Sized>(
     let (leaf, s1_index, s2_index) =
         Node::selection(root, state, rng, children, path, exploration_sq);
     let leaf = unsafe { &*leaf };
+
+    if !leaf.root {
+        if let Some(score) = leaf.terminal_score(state) {
+            Node::backpropagate(path, leaf, score, state);
+            return;
+        }
+    }
 
     let options = leaf.options.get().expect("options set during selection");
     options.s1[s1_index].add_virtual_loss();

@@ -2,7 +2,6 @@ use super::abilities::Abilities;
 use super::items::Items;
 use crate::choices::{Choices, MoveCategory};
 use crate::define_enum_with_from_str;
-use crate::instruction::BoostInstruction;
 use crate::instruction::{
     ChangeSideConditionInstruction, ChangeStatInstruction, ChangeType,
     ChangeVolatileStatusDurationInstruction, Instruction, RemoveVolatileStatusInstruction,
@@ -550,91 +549,6 @@ impl Pokemon {
 }
 
 impl Side {
-    pub fn reset_negative_boosts(
-        &mut self,
-        side_ref: SideReference,
-        instructions: &mut StateInstructions,
-    ) -> bool {
-        let mut changed = false;
-        if self.attack_boost < 0 {
-            instructions
-                .instruction_list
-                .push(Instruction::Boost(BoostInstruction {
-                    side_ref,
-                    stat: PokemonBoostableStat::Attack,
-                    amount: -self.attack_boost,
-                }));
-            self.attack_boost = 0;
-            changed = true;
-        }
-        if self.defense_boost < 0 {
-            instructions
-                .instruction_list
-                .push(Instruction::Boost(BoostInstruction {
-                    side_ref,
-                    stat: PokemonBoostableStat::Defense,
-                    amount: -self.defense_boost,
-                }));
-            self.defense_boost = 0;
-            changed = true;
-        }
-        if self.special_attack_boost < 0 {
-            instructions
-                .instruction_list
-                .push(Instruction::Boost(BoostInstruction {
-                    side_ref,
-                    stat: PokemonBoostableStat::SpecialAttack,
-                    amount: -self.special_attack_boost,
-                }));
-            self.special_attack_boost = 0;
-            changed = true;
-        }
-        if self.special_defense_boost < 0 {
-            instructions
-                .instruction_list
-                .push(Instruction::Boost(BoostInstruction {
-                    side_ref,
-                    stat: PokemonBoostableStat::SpecialDefense,
-                    amount: -self.special_defense_boost,
-                }));
-            self.special_defense_boost = 0;
-            changed = true;
-        }
-        if self.speed_boost < 0 {
-            instructions
-                .instruction_list
-                .push(Instruction::Boost(BoostInstruction {
-                    side_ref,
-                    stat: PokemonBoostableStat::Speed,
-                    amount: -self.speed_boost,
-                }));
-            self.speed_boost = 0;
-            changed = true;
-        }
-        if self.accuracy_boost < 0 {
-            instructions
-                .instruction_list
-                .push(Instruction::Boost(BoostInstruction {
-                    side_ref,
-                    stat: PokemonBoostableStat::Accuracy,
-                    amount: -self.accuracy_boost,
-                }));
-            self.accuracy_boost = 0;
-            changed = true;
-        }
-        if self.evasion_boost < 0 {
-            instructions
-                .instruction_list
-                .push(Instruction::Boost(BoostInstruction {
-                    side_ref,
-                    stat: PokemonBoostableStat::Evasion,
-                    amount: -self.evasion_boost,
-                }));
-            self.evasion_boost = 0;
-            changed = true;
-        }
-        changed
-    }
     pub fn active_is_charging_move(&self) -> Option<PokemonMoveIndex> {
         const CHARGE_VOLATILES: &[(PokemonVolatileStatus, Choices)] = &[
             (PokemonVolatileStatus::BOUNCE, Choices::BOUNCE),
