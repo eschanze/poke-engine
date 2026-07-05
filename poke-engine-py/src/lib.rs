@@ -11,14 +11,17 @@ use poke_engine::engine::generate_instructions::{
 use poke_engine::engine::items::Items;
 use poke_engine::engine::state::{MoveChoice, PokemonVolatileStatus, Terrain, Weather};
 use poke_engine::instruction::{Instruction, StateInstructions};
-use poke_engine::mcts::{perform_mcts, MctsResult, MctsSideResult, DEFAULT_EXPLORATION_CONSTANT};
+use poke_engine::mcts::{
+    perform_mcts, perform_mcts_ponder, perform_mcts_with_tree, MctsResult, MctsSideResult,
+    ReusableTree, DEFAULT_EXPLORATION_CONSTANT,
+};
 use poke_engine::mcts_threaded::perform_mcts_shared_tree;
 use poke_engine::pokemon::PokemonName;
 use poke_engine::search::iterative_deepen_expectiminimax;
 use poke_engine::state::{
     LastUsedMove, Move, Pokemon, PokemonIndex, PokemonMoves, PokemonNature, PokemonStatus,
-    PokemonType, Side, SideConditions, SidePokemon, State, StateTerrain, StateTrickRoom,
-    StateWeather, VolatileStatusBitset, VolatileStatusDurations,
+    PokemonType, Side, SideConditions, SidePokemon, SideReference, State, StateTerrain,
+    StateTrickRoom, StateWeather, VolatileStatusBitset, VolatileStatusDurations,
 };
 use std::str::FromStr;
 use std::time::Duration;
@@ -955,6 +958,148 @@ fn mcts(
     Ok(py_mcts_result)
 }
 
+fn parse_move(side: &Side, move_str: &str, label: &str) -> PyResult<MoveChoice> {
+    MoveChoice::from_string(move_str, side).ok_or_else(|| {
+        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "Invalid move for {}: {}",
+            label, move_str
+        ))
+    })
+}
+
+/// A persistent single-threaded MCTS searcher that keeps its tree across
+/// turns. Wrapped by the Python-side `MctsSearcher` class.
+///
+/// Contract: `search(state)` reuses the tree only when `state` is the exact
+/// position a previous `advance(...)` moved to (compared by serialization) —
+/// anything else (including newly revealed opponent information, which
+/// invalidates the old subtree's assumptions) starts a cold search.
+#[pyclass(name = "_MctsSearcher", module = "poke_engine", unsendable)]
+struct PyMctsSearcher {
+    tree: ReusableTree,
+    // the position the tree's root corresponds to; None means cold
+    root_state: Option<State>,
+}
+
+impl PyMctsSearcher {
+    // drop the tree if the caller's position is not the one the tree was
+    // advanced to: reusing statistics from a different position is unsound
+    fn require_matching_root(&mut self, state: &State) {
+        let matches = self
+            .root_state
+            .as_ref()
+            .is_some_and(|s| s.serialize() == state.serialize());
+        if !matches {
+            self.tree.reset();
+        }
+    }
+}
+
+#[pymethods]
+impl PyMctsSearcher {
+    #[new]
+    fn new() -> Self {
+        PyMctsSearcher {
+            tree: ReusableTree::new(),
+            root_state: None,
+        }
+    }
+
+    fn search(
+        &mut self,
+        py_state: PyState,
+        duration_ms: u64,
+        iterations: u32,
+    ) -> PyResult<PyMctsResult> {
+        let mut state: State = py_state.into();
+        self.require_matching_root(&state);
+        let (s1_options, s2_options) = state.root_get_all_options();
+        let result = perform_mcts_with_tree(
+            &mut self.tree,
+            &mut state,
+            s1_options,
+            s2_options,
+            Duration::from_millis(duration_ms),
+            iterations,
+            DEFAULT_EXPLORATION_CONSTANT,
+        );
+        let py_result = PyMctsResult::from_mcts_result(result, &state);
+        self.root_state = Some(state);
+        Ok(py_result)
+    }
+
+    fn ponder(
+        &mut self,
+        py_state: PyState,
+        side: String,
+        committed_move: String,
+        duration_ms: u64,
+        iterations: u32,
+    ) -> PyResult<PyMctsResult> {
+        let mut state: State = py_state.into();
+        self.require_matching_root(&state);
+        let ponder_side = match side.as_str() {
+            "s1" => SideReference::SideOne,
+            "s2" => SideReference::SideTwo,
+            _ => {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "side must be 's1' or 's2', got: {}",
+                    side
+                )))
+            }
+        };
+        let committed = match ponder_side {
+            SideReference::SideOne => parse_move(&state.side_one, &committed_move, "s1")?,
+            SideReference::SideTwo => parse_move(&state.side_two, &committed_move, "s2")?,
+        };
+        let (s1_options, s2_options) = state.root_get_all_options();
+        let result = perform_mcts_ponder(
+            &mut self.tree,
+            &mut state,
+            s1_options,
+            s2_options,
+            ponder_side,
+            &committed,
+            Duration::from_millis(duration_ms),
+            iterations,
+            DEFAULT_EXPLORATION_CONSTANT,
+        );
+        let py_result = PyMctsResult::from_mcts_result(result, &state);
+        self.root_state = Some(state);
+        Ok(py_result)
+    }
+
+    fn advance(
+        &mut self,
+        side_one_move: String,
+        side_two_move: String,
+        py_state: PyState,
+    ) -> PyResult<bool> {
+        let target: State = py_state.into();
+        let Some(mut root_state) = self.root_state.take() else {
+            self.tree.reset();
+            self.root_state = Some(target);
+            return Ok(false);
+        };
+        let s1_move = parse_move(&root_state.side_one, &side_one_move, "s1")?;
+        let s2_move = parse_move(&root_state.side_two, &side_two_move, "s2")?;
+        let hit = self
+            .tree
+            .advance_to_state(&mut root_state, &s1_move, &s2_move, &target);
+        self.root_state = Some(target);
+        Ok(hit)
+    }
+
+    fn reset(&mut self) {
+        self.tree.reset();
+        self.root_state = None;
+    }
+
+    fn root_visits(&self) -> u64 {
+        self.tree.root_visits()
+    }
+}
+
 #[pyfunction]
 fn id(py_state: PyState, duration_ms: u64) -> PyResult<PyIterativeDeepeningResult> {
     let mut state: State = py_state.into();
@@ -1142,5 +1287,6 @@ fn py_poke_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMove>()?;
     m.add_class::<PyStateInstructions>()?;
     m.add_class::<PyInstruction>()?;
+    m.add_class::<PyMctsSearcher>()?;
     Ok(())
 }

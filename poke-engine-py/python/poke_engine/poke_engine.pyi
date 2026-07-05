@@ -443,6 +443,28 @@ def mcts(
     """
     ...
 
+class _MctsSearcher:
+    """Persistent single-threaded MCTS searcher that keeps its tree across
+    turns. Use the `poke_engine.MctsSearcher` wrapper instead."""
+
+    def __init__(self) -> None: ...
+    def search(
+        self, py_state: State, duration_ms: int, iterations: int
+    ) -> MctsResult: ...
+    def ponder(
+        self,
+        py_state: State,
+        side: str,
+        committed_move: str,
+        duration_ms: int,
+        iterations: int,
+    ) -> MctsResult: ...
+    def advance(
+        self, side_one_move: str, side_two_move: str, py_state: State
+    ) -> bool: ...
+    def reset(self) -> None: ...
+    def root_visits(self) -> int: ...
+
 def generate_instructions(
     py_state: State,
     side_one_move: str,

@@ -3,11 +3,11 @@ use poke_engine::engine::generate_instructions::generate_instructions_from_move_
 use poke_engine::engine::state::MoveChoice;
 use poke_engine::instruction::StateInstructions;
 use poke_engine::mcts::{
-    perform_mcts, perform_mcts_with_tree, MctsSideResult, ReusableTree,
+    perform_mcts, perform_mcts_ponder, perform_mcts_with_tree, MctsSideResult, ReusableTree,
     DEFAULT_EXPLORATION_CONSTANT,
 };
 use poke_engine::mcts_threaded::perform_mcts_shared_tree;
-use poke_engine::state::State;
+use poke_engine::state::{SideReference, State};
 use rand::prelude::*;
 use rand::rngs::SmallRng;
 use std::process::exit;
@@ -54,6 +54,10 @@ struct Args {
     /// A keeps its search tree across turns (single-threaded searches only)
     #[clap(long, action = clap::ArgAction::Set, default_value_t = false)]
     a_tree_reuse: bool,
+    /// extra iterations A searches after committing its move, pinned to that
+    /// move (simulated pondering; implies --a-tree-reuse)
+    #[clap(long, default_value_t = 0)]
+    a_ponder_iterations: u32,
 
     #[clap(long, default_value_t = 20000)]
     b_iterations: u32,
@@ -70,6 +74,10 @@ struct Args {
     /// B keeps its search tree across turns (single-threaded searches only)
     #[clap(long, action = clap::ArgAction::Set, default_value_t = false)]
     b_tree_reuse: bool,
+    /// extra iterations B searches after committing its move, pinned to that
+    /// move (simulated pondering; implies --b-tree-reuse)
+    #[clap(long, default_value_t = 0)]
+    b_ponder_iterations: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -80,18 +88,20 @@ struct EngineConfig {
     exploration_constant: f32,
     branch_all_depths: bool,
     tree_reuse: bool,
+    ponder_iterations: u32,
 }
 
 impl EngineConfig {
     fn describe(&self) -> String {
         format!(
-            "iterations={} time_ms={} threads={} c={} branch_all={} tree_reuse={}",
+            "iterations={} time_ms={} threads={} c={} branch_all={} tree_reuse={} ponder={}",
             self.iterations,
             self.time_ms,
             self.threads,
             self.exploration_constant,
             self.branch_all_depths,
-            self.tree_reuse
+            self.tree_reuse,
+            self.ponder_iterations
         )
     }
 }
@@ -164,6 +174,38 @@ fn pick_move(
         SideRole::SideTwo => &result.s2,
     };
     best_by_visits(side_result)
+}
+
+fn ponder(
+    state: &mut State,
+    config: &EngineConfig,
+    role: &SideRole,
+    tree: &mut ReusableTree,
+    committed: &MoveChoice,
+) {
+    if config.ponder_iterations == 0 || !config.tree_reuse {
+        return;
+    }
+    poke_engine::mcts::BRANCH_ALL_DEPTHS.store(
+        config.branch_all_depths,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let (s1_options, s2_options) = state.root_get_all_options();
+    let ponder_side = match role {
+        SideRole::SideOne => SideReference::SideOne,
+        SideRole::SideTwo => SideReference::SideTwo,
+    };
+    perform_mcts_ponder(
+        tree,
+        state,
+        s1_options,
+        s2_options,
+        ponder_side,
+        committed,
+        Duration::ZERO,
+        config.ponder_iterations,
+        config.exploration_constant,
+    );
 }
 
 fn best_by_visits(side_result: &[MctsSideResult]) -> MoveChoice {
@@ -269,6 +311,23 @@ fn play_game(
 
         let s1_choice = pick_move(&mut state, s1_config, &SideRole::SideOne, &mut s1_tree);
         let s2_choice = pick_move(&mut state, s2_config, &SideRole::SideTwo, &mut s2_tree);
+        // simulated pondering: extra search pinned to the committed move,
+        // standing in for the opponent's think time. each side sees only its
+        // own commitment, so there is no information leak
+        ponder(
+            &mut state,
+            s1_config,
+            &SideRole::SideOne,
+            &mut s1_tree,
+            &s1_choice,
+        );
+        ponder(
+            &mut state,
+            s2_config,
+            &SideRole::SideTwo,
+            &mut s2_tree,
+            &s2_choice,
+        );
         if verbose {
             println!(
                 "    decision {}: s1={} s2={}",
@@ -355,11 +414,13 @@ fn main() {
         args.limit.min(states.len())
     };
 
-    if args.a_tree_reuse && args.a_threads > 1 {
-        eprintln!("--a-tree-reuse only works with single-threaded searches; disabling");
+    let a_tree_reuse = args.a_tree_reuse || args.a_ponder_iterations > 0;
+    let b_tree_reuse = args.b_tree_reuse || args.b_ponder_iterations > 0;
+    if a_tree_reuse && args.a_threads > 1 {
+        eprintln!("--a-tree-reuse/--a-ponder-iterations need single-threaded searches; disabling");
     }
-    if args.b_tree_reuse && args.b_threads > 1 {
-        eprintln!("--b-tree-reuse only works with single-threaded searches; disabling");
+    if b_tree_reuse && args.b_threads > 1 {
+        eprintln!("--b-tree-reuse/--b-ponder-iterations need single-threaded searches; disabling");
     }
     let config_a = EngineConfig {
         iterations: args.a_iterations,
@@ -367,7 +428,8 @@ fn main() {
         threads: args.a_threads,
         exploration_constant: args.a_c,
         branch_all_depths: args.a_branch_all,
-        tree_reuse: args.a_tree_reuse && args.a_threads <= 1,
+        tree_reuse: a_tree_reuse && args.a_threads <= 1,
+        ponder_iterations: args.a_ponder_iterations,
     };
     let config_b = EngineConfig {
         iterations: args.b_iterations,
@@ -375,7 +437,8 @@ fn main() {
         threads: args.b_threads,
         exploration_constant: args.b_c,
         branch_all_depths: args.b_branch_all,
-        tree_reuse: args.b_tree_reuse && args.b_threads <= 1,
+        tree_reuse: b_tree_reuse && args.b_threads <= 1,
+        ponder_iterations: args.b_ponder_iterations,
     };
     println!("A: {}", config_a.describe());
     println!("B: {}", config_b.describe());

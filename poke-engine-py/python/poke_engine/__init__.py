@@ -145,6 +145,103 @@ class MctsResult:
         )
 
 
+class MctsSearcher:
+    """
+    A persistent monte-carlo-tree-searcher that keeps its search tree
+    across turns, so each search starts from the statistics accumulated on
+    the previous turn instead of from scratch.
+
+    Usage per turn:
+        result = searcher.search(state, duration_ms=100)
+        # ... commit/send your move, then while waiting for the turn:
+        searcher.ponder(state, side="s1", committed_move=my_move, duration_ms=5000)
+        # ... turn resolves and you observe the new state:
+        searcher.advance(s1_move, s2_move, new_state)
+
+    `advance` matches the observed new state against the tree's predicted
+    outcomes; if nothing matches exactly (e.g. newly revealed opponent
+    information changed the state), it returns False and the next search
+    simply starts cold. `search` and `ponder` only reuse the tree when
+    given the exact state a previous `advance` moved to.
+    """
+
+    def __init__(self):
+        self._searcher = _MctsSearcher()
+
+    def search(
+        self, state: State, duration_ms: int = 1000, iterations: int = 0
+    ) -> MctsResult:
+        """
+        Search the position, reusing the tree kept from previous turns
+        when possible. Single-threaded.
+
+        :param state: the state to search through
+        :type state: State
+        :param duration_ms: time in milliseconds to run the search. ignored if iterations > 0
+        :type duration_ms: int
+        :param iterations: exact number of monte-carlo iterations to run
+        :type iterations: int
+        :return: the result of the search
+        :rtype: MctsResult
+        """
+        return MctsResult._from_rust(
+            self._searcher.search(state, duration_ms, iterations)
+        )
+
+    def ponder(
+        self,
+        state: State,
+        side: str,
+        committed_move: str,
+        duration_ms: int = 1000,
+        iterations: int = 0,
+    ) -> MctsResult:
+        """
+        Keep searching after committing to a move (i.e. during the
+        opponent's think time). Your side's root move is pinned to
+        `committed_move` so every iteration deepens lines that survive the
+        coming `advance`; the opponent's side of the result doubles as a
+        prediction of their response.
+
+        :param state: the current (pre-turn) state, same as the last search
+        :type state: State
+        :param side: which side you are: "s1" or "s2"
+        :type side: str
+        :param committed_move: the move you committed to
+        :type committed_move: str
+        :return: the result of the search
+        :rtype: MctsResult
+        """
+        return MctsResult._from_rust(
+            self._searcher.ponder(state, side, committed_move, duration_ms, iterations)
+        )
+
+    def advance(self, side_one_move: str, side_two_move: str, new_state: State) -> bool:
+        """
+        Tell the searcher what happened: the moves both sides made and the
+        state the battle is now in. Keeps the matching subtree for the next
+        search when the observed state matches a predicted outcome exactly.
+
+        :param side_one_move: the move side one made
+        :type side_one_move: str
+        :param side_two_move: the move side two made
+        :type side_two_move: str
+        :param new_state: the state the battle is now in
+        :type new_state: State
+        :return: whether the subtree was kept (False means the next search starts cold)
+        :rtype: bool
+        """
+        return self._searcher.advance(side_one_move, side_two_move, new_state)
+
+    def reset(self):
+        """Drop the tree, e.g. when starting a new battle."""
+        self._searcher.reset()
+
+    def root_visits(self) -> int:
+        """Visits already accumulated on the tree root (0 = cold)."""
+        return self._searcher.root_visits()
+
+
 def monte_carlo_tree_search(
     state: State, duration_ms: int = 1000, iterations: int = 0, threads: int = 1
 ) -> MctsResult:

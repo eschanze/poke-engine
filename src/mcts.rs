@@ -2,7 +2,7 @@ use crate::engine::evaluate::evaluate;
 use crate::engine::generate_instructions::generate_instructions_from_move_pair;
 use crate::engine::state::MoveChoice;
 use crate::instruction::{Instruction, StateInstructions};
-use crate::state::State;
+use crate::state::{SideReference, State};
 use rand::prelude::*;
 use rand::rngs::SmallRng;
 use std::time::Duration;
@@ -166,30 +166,48 @@ impl Node {
         state: &mut State,
         rng: &mut impl Rng,
         exploration_sq: f32,
+        root_force: (Option<usize>, Option<usize>),
     ) -> (*mut Node, usize, usize) {
-        if self.terminal_score(state).is_some() {
-            return (self as *mut Node, 0, 0);
-        }
+        // root_force pins one side's root move while pondering a committed
+        // move; it is consumed on the first (root) step so the walk below
+        // pays nothing for it
+        let mut force = root_force;
+        let mut current: *mut Node = self;
+        loop {
+            let node = &mut *current;
+            if node.terminal_score(state).is_some() {
+                return (current, 0, 0);
+            }
 
-        if self.s1_options.is_none() {
-            crate::prof_scope!(crate::prof::sec::GET_OPTIONS);
-            let (s1_options, s2_options) = state.get_all_options();
-            self.populate(s1_options, s2_options);
-        }
+            if node.s1_options.is_none() {
+                crate::prof_scope!(crate::prof::sec::GET_OPTIONS);
+                let (s1_options, s2_options) = state.get_all_options();
+                node.populate(s1_options, s2_options);
+            }
 
-        let s1_mc_index =
-            self.maximize_ucb_for_side(self.s1_options.as_ref().unwrap(), exploration_sq);
-        let s2_mc_index =
-            self.maximize_ucb_for_side(self.s2_options.as_ref().unwrap(), exploration_sq);
-        let key = (s1_mc_index * self.s2_options.as_ref().unwrap().len() + s2_mc_index) as u32;
-        let child_vec_ptr: *mut Box<[Node]> =
-            match self.children.iter_mut().find(|(k, _)| *k == key) {
-                Some(entry) => &mut entry.1,
-                None => return (self as *mut Node, s1_mc_index, s2_mc_index),
+            let s1_mc_index = match force.0 {
+                Some(index) => index,
+                None => {
+                    node.maximize_ucb_for_side(node.s1_options.as_ref().unwrap(), exploration_sq)
+                }
             };
-        let chosen_child = self.sample_node(child_vec_ptr, rng);
-        state.apply_instructions(&(*chosen_child).instructions.instruction_list);
-        (*chosen_child).selection(state, rng, exploration_sq)
+            let s2_mc_index = match force.1 {
+                Some(index) => index,
+                None => {
+                    node.maximize_ucb_for_side(node.s2_options.as_ref().unwrap(), exploration_sq)
+                }
+            };
+            force = (None, None);
+            let key = (s1_mc_index * node.s2_options.as_ref().unwrap().len() + s2_mc_index) as u32;
+            let child_vec_ptr: *mut Box<[Node]> =
+                match node.children.iter_mut().find(|(k, _)| *k == key) {
+                    Some(entry) => &mut entry.1,
+                    None => return (current, s1_mc_index, s2_mc_index),
+                };
+            let chosen_child = node.sample_node(child_vec_ptr, rng);
+            state.apply_instructions(&(*chosen_child).instructions.instruction_list);
+            current = chosen_child;
+        }
     }
 
     unsafe fn sample_node(&self, move_vector: *mut Box<[Node]>, rng: &mut impl Rng) -> *mut Node {
@@ -360,10 +378,11 @@ fn mcts_iteration(
     rng: &mut impl Rng,
     tree_bytes: &mut u64,
     exploration_sq: f32,
+    root_force: (Option<usize>, Option<usize>),
 ) {
     let (mut new_node, s1_move, s2_move) = {
         crate::prof_scope!(crate::prof::sec::SELECTION);
-        unsafe { root_node.selection(state, rng, exploration_sq) }
+        unsafe { root_node.selection(state, rng, exploration_sq, root_force) }
     };
     new_node = {
         crate::prof_scope!(crate::prof::sec::EXPAND);
@@ -393,6 +412,7 @@ fn run_mcts_loop(
     limit: SearchLimit,
     exploration_sq: f32,
     start_visits: u64,
+    root_force: (Option<usize>, Option<usize>),
 ) {
     // SmallRng is much cheaper than the default crypto-grade ThreadRng and
     // statistical quality is all that matters here
@@ -408,6 +428,7 @@ fn run_mcts_loop(
                 &mut rng,
                 &mut tree_bytes,
                 exploration_sq,
+                root_force,
             );
         }
         if tree_bytes >= MCTS_MAX_TREE_BYTES {
@@ -561,6 +582,57 @@ impl ReusableTree {
         s2_move: &MoveChoice,
         outcome: &[Instruction],
     ) -> bool {
+        self.advance_with(s1_move, s2_move, |nodes| {
+            // duplicate instruction lists (same resulting state) are
+            // possible; prefer the most-visited match
+            let mut chosen: Option<usize> = None;
+            for (index, node) in nodes.iter().enumerate() {
+                if node.instructions.instruction_list == outcome
+                    && chosen.map_or(true, |c| node.times_visited > nodes[c].times_visited)
+                {
+                    chosen = Some(index);
+                }
+            }
+            chosen
+        })
+    }
+
+    /// Like [`ReusableTree::advance`], but matches the child by its
+    /// *resulting state* instead of its instruction list: each candidate's
+    /// instructions are applied to `root_state` (the state this tree's root
+    /// was searched from; restored before returning) and compared against
+    /// `target` by serialization. Use when the transition was observed
+    /// externally (e.g. from a battle server) rather than sampled from
+    /// engine-generated instructions.
+    pub fn advance_to_state(
+        &mut self,
+        root_state: &mut State,
+        s1_move: &MoveChoice,
+        s2_move: &MoveChoice,
+        target: &State,
+    ) -> bool {
+        let target_serialized = target.serialize();
+        self.advance_with(s1_move, s2_move, |nodes| {
+            let mut chosen: Option<usize> = None;
+            for (index, node) in nodes.iter().enumerate() {
+                root_state.apply_instructions(&node.instructions.instruction_list);
+                let matches = root_state.serialize() == target_serialized;
+                root_state.reverse_instructions(&node.instructions.instruction_list);
+                if matches && chosen.map_or(true, |c| node.times_visited > nodes[c].times_visited) {
+                    chosen = Some(index);
+                }
+            }
+            chosen
+        })
+    }
+
+    /// shared re-rooting: locate the (`s1_move`, `s2_move`) branch, let
+    /// `pick` choose the outcome node, prune its siblings and make it the
+    /// root. Any failure clears the tree.
+    fn advance_with<F>(&mut self, s1_move: &MoveChoice, s2_move: &MoveChoice, pick: F) -> bool
+    where
+        F: FnOnce(&[Node]) -> Option<usize>,
+    {
         // take ownership so every early return drops the stale tree
         let Some(mut storage) = self.storage.take() else {
             return false;
@@ -584,17 +656,7 @@ impl ReusableTree {
             root.children.swap_remove(entry_index).1
         };
 
-        // duplicate instruction lists (same resulting state) are possible;
-        // prefer the most-visited match
-        let mut chosen: Option<usize> = None;
-        for (index, node) in nodes.iter().enumerate() {
-            if node.instructions.instruction_list == outcome
-                && chosen.map_or(true, |c| node.times_visited > nodes[c].times_visited)
-            {
-                chosen = Some(index);
-            }
-        }
-        let Some(root_index) = chosen else {
+        let Some(root_index) = pick(&nodes) else {
             return false;
         };
 
@@ -648,25 +710,17 @@ fn options_match(
     }
 }
 
-/// Like [`perform_mcts`], but continues from `tree` when its root matches the
-/// caller's option lists (as after a successful [`ReusableTree::advance`]);
-/// otherwise the tree is replaced with a fresh root. Iteration limits and the
-/// returned `iteration_count` count only this call's iterations.
-pub fn perform_mcts_with_tree(
+// reuse `tree`'s root when it offers exactly the options the caller sees in
+// the same order (mismatches happen when root-level option filtering, e.g.
+// trapping or locked moves, differs from the in-tree get_all_options view)
+// and its eval anchor is still close enough to the current position for its
+// stored scores to stay meaningful; otherwise install a fresh root
+fn ensure_root(
     tree: &mut ReusableTree,
-    state: &mut State,
+    current_eval: f32,
     side_one_options: Vec<MoveChoice>,
     side_two_options: Vec<MoveChoice>,
-    max_time: Duration,
-    max_iterations: u32,
-    exploration_constant: f32,
-) -> MctsResult {
-    let current_eval = evaluate(state);
-    // a reused root must offer exactly the options the caller sees in the
-    // same order (mismatches happen when root-level option filtering, e.g.
-    // trapping or locked moves, differs from the in-tree get_all_options
-    // view), and the tree's eval anchor must still be close enough to the
-    // current position for its stored scores to stay meaningful
+) {
     let warm = match tree.storage.as_ref() {
         Some(storage) => {
             options_match(storage.root_ref(), &side_one_options, &side_two_options)
@@ -683,6 +737,22 @@ pub fn perform_mcts_with_tree(
         tree.storage = Some(TreeStorage::Fresh(root_node));
         tree.anchor_eval = current_eval;
     }
+}
+
+/// Like [`perform_mcts`], but continues from `tree` when its root matches the
+/// caller's option lists (as after a successful [`ReusableTree::advance`]);
+/// otherwise the tree is replaced with a fresh root. Iteration limits and the
+/// returned `iteration_count` count only this call's iterations.
+pub fn perform_mcts_with_tree(
+    tree: &mut ReusableTree,
+    state: &mut State,
+    side_one_options: Vec<MoveChoice>,
+    side_two_options: Vec<MoveChoice>,
+    max_time: Duration,
+    max_iterations: u32,
+    exploration_constant: f32,
+) -> MctsResult {
+    ensure_root(tree, evaluate(state), side_one_options, side_two_options);
 
     let root_node = tree.storage.as_mut().unwrap().root_mut();
     let start_visits = root_node.times_visited;
@@ -694,6 +764,55 @@ pub fn perform_mcts_with_tree(
         search_limit(max_time, max_iterations),
         exploration_constant * exploration_constant,
         start_visits,
+        (None, None),
+    );
+
+    collect_result(root_node, root_node.times_visited - start_visits)
+}
+
+/// Ponder: search with `ponder_side`'s root move pinned to `committed_move`.
+/// Use during the opponent's think time after committing to a move — every
+/// iteration flows into subtrees that can survive the coming
+/// [`ReusableTree::advance`], and the other side's root statistics double as
+/// an opponent prediction. Below the root the search is unrestricted. If
+/// `committed_move` is not among the root's options the search runs
+/// unrestricted (equivalent to [`perform_mcts_with_tree`]).
+pub fn perform_mcts_ponder(
+    tree: &mut ReusableTree,
+    state: &mut State,
+    side_one_options: Vec<MoveChoice>,
+    side_two_options: Vec<MoveChoice>,
+    ponder_side: SideReference,
+    committed_move: &MoveChoice,
+    max_time: Duration,
+    max_iterations: u32,
+    exploration_constant: f32,
+) -> MctsResult {
+    ensure_root(tree, evaluate(state), side_one_options, side_two_options);
+
+    let root_node = tree.storage.as_mut().unwrap().root_mut();
+    let committed_index = |options: &Option<Vec<MoveNode>>| {
+        options
+            .as_ref()
+            .unwrap()
+            .iter()
+            .position(|m| &m.move_choice == committed_move)
+    };
+    let root_force = match ponder_side {
+        SideReference::SideOne => (committed_index(&root_node.s1_options), None),
+        SideReference::SideTwo => (None, committed_index(&root_node.s2_options)),
+    };
+
+    let start_visits = root_node.times_visited;
+    let root_eval = tree.anchor_eval;
+    run_mcts_loop(
+        root_node,
+        state,
+        &root_eval,
+        search_limit(max_time, max_iterations),
+        exploration_constant * exploration_constant,
+        start_visits,
+        root_force,
     );
 
     collect_result(root_node, root_node.times_visited - start_visits)
