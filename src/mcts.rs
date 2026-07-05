@@ -392,6 +392,7 @@ fn run_mcts_loop(
     root_eval: &f32,
     limit: SearchLimit,
     exploration_sq: f32,
+    start_visits: u64,
 ) {
     // SmallRng is much cheaper than the default crypto-grade ThreadRng and
     // statistical quality is all that matters here
@@ -412,6 +413,8 @@ fn run_mcts_loop(
         if tree_bytes >= MCTS_MAX_TREE_BYTES {
             break;
         }
+        // iteration limits count iterations of *this* search: a tree reused
+        // across turns starts with visits from previous searches
         match limit {
             SearchLimit::Time(max_time) => {
                 if start_time.elapsed() >= max_time {
@@ -419,12 +422,14 @@ fn run_mcts_loop(
                 }
             }
             SearchLimit::Iterations(n) => {
-                if root_node.times_visited >= n as u64 {
+                if root_node.times_visited - start_visits >= n as u64 {
                     break;
                 }
             }
             SearchLimit::TimeOrIterations(max_time, n) => {
-                if start_time.elapsed() >= max_time || root_node.times_visited >= n as u64 {
+                if start_time.elapsed() >= max_time
+                    || root_node.times_visited - start_visits >= n as u64
+                {
                     break;
                 }
             }
@@ -432,37 +437,18 @@ fn run_mcts_loop(
     }
 }
 
-pub fn perform_mcts(
-    state: &mut State,
-    side_one_options: Vec<MoveChoice>,
-    side_two_options: Vec<MoveChoice>,
-    max_time: Duration,
-    max_iterations: u32,
-    exploration_constant: f32,
-) -> MctsResult {
-    let mut root_node = Node::new();
-    unsafe {
-        root_node.populate(side_one_options, side_two_options);
-    }
-    root_node.root = true;
-
-    let root_eval = evaluate(state);
-    let search_limit = if max_iterations > 0 && max_time > Duration::from_millis(0) {
+fn search_limit(max_time: Duration, max_iterations: u32) -> SearchLimit {
+    if max_iterations > 0 && max_time > Duration::from_millis(0) {
         SearchLimit::TimeOrIterations(max_time, max_iterations)
     } else if max_iterations > 0 {
         SearchLimit::Iterations(max_iterations)
     } else {
         SearchLimit::Time(max_time)
-    };
-    run_mcts_loop(
-        &mut root_node,
-        state,
-        &root_eval,
-        search_limit,
-        exploration_constant * exploration_constant,
-    );
+    }
+}
 
-    let result = MctsResult {
+fn collect_result(root_node: &Node, iteration_count: u64) -> MctsResult {
+    MctsResult {
         s1: root_node
             .s1_options
             .as_ref()
@@ -485,8 +471,250 @@ pub fn perform_mcts(
                 visits: v.visits,
             })
             .collect(),
-        iteration_count: root_node.times_visited,
-    };
+        iteration_count,
+    }
+}
 
-    result
+// The current root and the allocation that keeps it alive. A re-rooted node
+// stays inside the boxed slice it was created in: its children hold parent
+// pointers to that address, so the whole slice is kept (siblings get their
+// subtrees pruned but occupy their Node-sized slots until the next advance)
+enum TreeStorage {
+    Fresh(Box<Node>),
+    Branch {
+        nodes: Box<[Node]>,
+        root_index: usize,
+    },
+}
+
+impl TreeStorage {
+    fn root_ref(&self) -> &Node {
+        match self {
+            TreeStorage::Fresh(node) => node,
+            TreeStorage::Branch { nodes, root_index } => &nodes[*root_index],
+        }
+    }
+
+    fn root_mut(&mut self) -> &mut Node {
+        match self {
+            TreeStorage::Fresh(node) => node,
+            TreeStorage::Branch { nodes, root_index } => &mut nodes[*root_index],
+        }
+    }
+}
+
+// A tree's rollout values are all centered on the eval anchor it was born
+// with (see `ReusableTree`), so the anchor goes stale as the game drifts.
+// Past this eval distance the sigmoid loses too much resolution
+// (sigmoid(150 * 0.0125) ~= 0.87) and the tree is discarded instead of
+// reused.
+const MAX_ANCHOR_DRIFT: f32 = 150.0;
+
+/// A single-threaded MCTS tree that can be kept across turns. Search with
+/// [`perform_mcts_with_tree`]; after the move pair is actually played, call
+/// [`ReusableTree::advance`] with the pair and the sampled outcome's
+/// instruction list to promote the matching subtree (statistics included) to
+/// the root of the next search. If the outcome doesn't exactly match an
+/// expanded child, the tree is discarded and the next search starts cold.
+///
+/// Rollout scores are `sigmoid(eval - anchor)`, so scores from different
+/// anchors are not comparable. A tree therefore keeps the anchor of the
+/// search that created it for its whole lifetime (mixing anchors across
+/// reused statistics measured -37 Elo, see WORKLOG 2026-07-05), and is
+/// discarded when the current position's eval drifts more than
+/// `MAX_ANCHOR_DRIFT` from the anchor.
+///
+/// Caveat: the memory budget only counts bytes allocated within one search,
+/// not the carried-over tree.
+pub struct ReusableTree {
+    storage: Option<TreeStorage>,
+    anchor_eval: f32,
+}
+
+impl ReusableTree {
+    pub fn new() -> Self {
+        ReusableTree {
+            storage: None,
+            anchor_eval: 0.0,
+        }
+    }
+
+    /// drop any stored tree; the next search starts cold
+    pub fn reset(&mut self) {
+        self.storage = None;
+    }
+
+    /// visits accumulated on the current root (0 for a cold tree)
+    pub fn root_visits(&self) -> u64 {
+        self.storage
+            .as_ref()
+            .map_or(0, |storage| storage.root_ref().times_visited)
+    }
+
+    /// Re-root to the child reached by (`s1_move`, `s2_move`) whose
+    /// instruction list equals `outcome` (identical instructions imply an
+    /// identical resulting state). Returns whether the subtree was kept; on
+    /// any mismatch the tree is cleared.
+    pub fn advance(
+        &mut self,
+        s1_move: &MoveChoice,
+        s2_move: &MoveChoice,
+        outcome: &[Instruction],
+    ) -> bool {
+        // take ownership so every early return drops the stale tree
+        let Some(mut storage) = self.storage.take() else {
+            return false;
+        };
+
+        let mut nodes = {
+            let root = storage.root_mut();
+            let (Some(s1_options), Some(s2_options)) = (&root.s1_options, &root.s2_options) else {
+                return false;
+            };
+            let Some(s1_index) = s1_options.iter().position(|m| &m.move_choice == s1_move) else {
+                return false;
+            };
+            let Some(s2_index) = s2_options.iter().position(|m| &m.move_choice == s2_move) else {
+                return false;
+            };
+            let key = (s1_index * s2_options.len() + s2_index) as u32;
+            let Some(entry_index) = root.children.iter().position(|(k, _)| *k == key) else {
+                return false;
+            };
+            root.children.swap_remove(entry_index).1
+        };
+
+        // duplicate instruction lists (same resulting state) are possible;
+        // prefer the most-visited match
+        let mut chosen: Option<usize> = None;
+        for (index, node) in nodes.iter().enumerate() {
+            if node.instructions.instruction_list == outcome
+                && chosen.map_or(true, |c| node.times_visited > nodes[c].times_visited)
+            {
+                chosen = Some(index);
+            }
+        }
+        let Some(root_index) = chosen else {
+            return false;
+        };
+
+        // free everything except the extracted branch before touching parent
+        // pointers: the new root's parent (the old root) is about to die
+        drop(storage);
+
+        for (index, node) in nodes.iter_mut().enumerate() {
+            if index != root_index {
+                // unreachable siblings share the slice allocation; free
+                // their subtrees and options
+                node.children = Vec::new();
+                node.s1_options = None;
+                node.s2_options = None;
+            }
+        }
+        let new_root = &mut nodes[root_index];
+        new_root.root = true;
+        new_root.parent = std::ptr::null_mut();
+        new_root.instructions = StateInstructions::default();
+        self.storage = Some(TreeStorage::Branch { nodes, root_index });
+        true
+    }
+}
+
+impl Default for ReusableTree {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn options_match(
+    node: &Node,
+    side_one_options: &[MoveChoice],
+    side_two_options: &[MoveChoice],
+) -> bool {
+    match (&node.s1_options, &node.s2_options) {
+        (Some(s1), Some(s2)) => {
+            s1.len() == side_one_options.len()
+                && s2.len() == side_two_options.len()
+                && s1
+                    .iter()
+                    .zip(side_one_options)
+                    .all(|(a, b)| &a.move_choice == b)
+                && s2
+                    .iter()
+                    .zip(side_two_options)
+                    .all(|(a, b)| &a.move_choice == b)
+        }
+        _ => false,
+    }
+}
+
+/// Like [`perform_mcts`], but continues from `tree` when its root matches the
+/// caller's option lists (as after a successful [`ReusableTree::advance`]);
+/// otherwise the tree is replaced with a fresh root. Iteration limits and the
+/// returned `iteration_count` count only this call's iterations.
+pub fn perform_mcts_with_tree(
+    tree: &mut ReusableTree,
+    state: &mut State,
+    side_one_options: Vec<MoveChoice>,
+    side_two_options: Vec<MoveChoice>,
+    max_time: Duration,
+    max_iterations: u32,
+    exploration_constant: f32,
+) -> MctsResult {
+    let current_eval = evaluate(state);
+    // a reused root must offer exactly the options the caller sees in the
+    // same order (mismatches happen when root-level option filtering, e.g.
+    // trapping or locked moves, differs from the in-tree get_all_options
+    // view), and the tree's eval anchor must still be close enough to the
+    // current position for its stored scores to stay meaningful
+    let warm = match tree.storage.as_ref() {
+        Some(storage) => {
+            options_match(storage.root_ref(), &side_one_options, &side_two_options)
+                && (current_eval - tree.anchor_eval).abs() <= MAX_ANCHOR_DRIFT
+        }
+        None => false,
+    };
+    if !warm {
+        let mut root_node = Box::new(Node::new());
+        root_node.root = true;
+        unsafe {
+            root_node.populate(side_one_options, side_two_options);
+        }
+        tree.storage = Some(TreeStorage::Fresh(root_node));
+        tree.anchor_eval = current_eval;
+    }
+
+    let root_node = tree.storage.as_mut().unwrap().root_mut();
+    let start_visits = root_node.times_visited;
+    let root_eval = tree.anchor_eval;
+    run_mcts_loop(
+        root_node,
+        state,
+        &root_eval,
+        search_limit(max_time, max_iterations),
+        exploration_constant * exploration_constant,
+        start_visits,
+    );
+
+    collect_result(root_node, root_node.times_visited - start_visits)
+}
+
+pub fn perform_mcts(
+    state: &mut State,
+    side_one_options: Vec<MoveChoice>,
+    side_two_options: Vec<MoveChoice>,
+    max_time: Duration,
+    max_iterations: u32,
+    exploration_constant: f32,
+) -> MctsResult {
+    let mut tree = ReusableTree::new();
+    perform_mcts_with_tree(
+        &mut tree,
+        state,
+        side_one_options,
+        side_two_options,
+        max_time,
+        max_iterations,
+        exploration_constant,
+    )
 }

@@ -2,7 +2,10 @@ use clap::Parser;
 use poke_engine::engine::generate_instructions::generate_instructions_from_move_pair;
 use poke_engine::engine::state::MoveChoice;
 use poke_engine::instruction::StateInstructions;
-use poke_engine::mcts::{perform_mcts, MctsSideResult, DEFAULT_EXPLORATION_CONSTANT};
+use poke_engine::mcts::{
+    perform_mcts, perform_mcts_with_tree, MctsSideResult, ReusableTree,
+    DEFAULT_EXPLORATION_CONSTANT,
+};
 use poke_engine::mcts_threaded::perform_mcts_shared_tree;
 use poke_engine::state::State;
 use rand::prelude::*;
@@ -48,6 +51,9 @@ struct Args {
     /// A branches on damage rolls/crits at every depth (pass =false for 2-ply-only)
     #[clap(long, action = clap::ArgAction::Set, default_value_t = true)]
     a_branch_all: bool,
+    /// A keeps its search tree across turns (single-threaded searches only)
+    #[clap(long, action = clap::ArgAction::Set, default_value_t = false)]
+    a_tree_reuse: bool,
 
     #[clap(long, default_value_t = 20000)]
     b_iterations: u32,
@@ -61,6 +67,9 @@ struct Args {
     /// B branches on damage rolls/crits at every depth (pass =false for 2-ply-only)
     #[clap(long, action = clap::ArgAction::Set, default_value_t = true)]
     b_branch_all: bool,
+    /// B keeps its search tree across turns (single-threaded searches only)
+    #[clap(long, action = clap::ArgAction::Set, default_value_t = false)]
+    b_tree_reuse: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -70,17 +79,19 @@ struct EngineConfig {
     threads: usize,
     exploration_constant: f32,
     branch_all_depths: bool,
+    tree_reuse: bool,
 }
 
 impl EngineConfig {
     fn describe(&self) -> String {
         format!(
-            "iterations={} time_ms={} threads={} c={} branch_all={}",
+            "iterations={} time_ms={} threads={} c={} branch_all={} tree_reuse={}",
             self.iterations,
             self.time_ms,
             self.threads,
             self.exploration_constant,
-            self.branch_all_depths
+            self.branch_all_depths,
+            self.tree_reuse
         )
     }
 }
@@ -92,7 +103,12 @@ enum SideRole {
 
 /// run this side's search and return its chosen move: most visits,
 /// tie-broken by average score (robust child)
-fn pick_move(state: &mut State, config: &EngineConfig, role: &SideRole) -> MoveChoice {
+fn pick_move(
+    state: &mut State,
+    config: &EngineConfig,
+    role: &SideRole,
+    tree: &mut ReusableTree,
+) -> MoveChoice {
     let (s1_options, s2_options) = state.root_get_all_options();
 
     // forced decisions don't need a search
@@ -120,6 +136,16 @@ fn pick_move(state: &mut State, config: &EngineConfig, role: &SideRole) -> MoveC
             max_time,
             config.iterations,
             config.threads,
+            config.exploration_constant,
+        )
+    } else if config.tree_reuse {
+        perform_mcts_with_tree(
+            tree,
+            state,
+            s1_options,
+            s2_options,
+            max_time,
+            config.iterations,
             config.exploration_constant,
         )
     } else {
@@ -170,11 +196,48 @@ fn sample_outcome<'a>(
     &instructions[instructions.len() - 1]
 }
 
+#[derive(Default, Clone, Copy)]
+struct ReuseCounter {
+    attempts: usize,
+    hits: usize,
+    /// visits already on the re-rooted subtree after each hit: the warm
+    /// start the next search inherits
+    warm_visits: u64,
+}
+
+impl ReuseCounter {
+    fn add(&mut self, other: &ReuseCounter) {
+        self.attempts += other.attempts;
+        self.hits += other.hits;
+        self.warm_visits += other.warm_visits;
+    }
+
+    fn track(&mut self, hit: bool, warm_visits: u64) {
+        self.attempts += 1;
+        if hit {
+            self.hits += 1;
+            self.warm_visits += warm_visits;
+        }
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "{}/{} ({:.1}%), avg warm visits/hit: {}",
+            self.hits,
+            self.attempts,
+            100.0 * self.hits as f64 / self.attempts.max(1) as f64,
+            self.warm_visits / self.hits.max(1) as u64
+        )
+    }
+}
+
 struct GameResult {
     /// 1.0 side one won, 0.0 side two won, 0.5 draw (decision cap reached)
     s1_score: f64,
     decisions: usize,
     capped: bool,
+    s1_reuse: ReuseCounter,
+    s2_reuse: ReuseCounter,
 }
 
 fn play_game(
@@ -187,6 +250,11 @@ fn play_game(
 ) -> GameResult {
     let mut state = initial_state.clone();
     let mut decisions = 0;
+    // per-game search trees, only consulted when a side has tree_reuse set
+    let mut s1_tree = ReusableTree::new();
+    let mut s2_tree = ReusableTree::new();
+    let mut s1_reuse = ReuseCounter::default();
+    let mut s2_reuse = ReuseCounter::default();
     while decisions < max_turns {
         let over = state.battle_is_over();
         if over != 0.0 {
@@ -194,11 +262,13 @@ fn play_game(
                 s1_score: if over > 0.0 { 1.0 } else { 0.0 },
                 decisions,
                 capped: false,
+                s1_reuse,
+                s2_reuse,
             };
         }
 
-        let s1_choice = pick_move(&mut state, s1_config, &SideRole::SideOne);
-        let s2_choice = pick_move(&mut state, s2_config, &SideRole::SideTwo);
+        let s1_choice = pick_move(&mut state, s1_config, &SideRole::SideOne, &mut s1_tree);
+        let s2_choice = pick_move(&mut state, s2_config, &SideRole::SideTwo, &mut s2_tree);
         if verbose {
             println!(
                 "    decision {}: s1={} s2={}",
@@ -217,9 +287,21 @@ fn play_game(
                 s1_score: 0.5,
                 decisions,
                 capped: true,
+                s1_reuse,
+                s2_reuse,
             };
         }
         let outcome = sample_outcome(&instructions, rng);
+        // re-root each side's tree onto what actually happened (both sides
+        // see the full state, so both advance with the same transition)
+        if s1_config.tree_reuse {
+            let hit = s1_tree.advance(&s1_choice, &s2_choice, &outcome.instruction_list);
+            s1_reuse.track(hit, s1_tree.root_visits());
+        }
+        if s2_config.tree_reuse {
+            let hit = s2_tree.advance(&s1_choice, &s2_choice, &outcome.instruction_list);
+            s2_reuse.track(hit, s2_tree.root_visits());
+        }
         state.apply_instructions(&outcome.instruction_list);
         decisions += 1;
     }
@@ -227,6 +309,8 @@ fn play_game(
         s1_score: 0.5,
         decisions,
         capped: true,
+        s1_reuse,
+        s2_reuse,
     }
 }
 
@@ -271,12 +355,19 @@ fn main() {
         args.limit.min(states.len())
     };
 
+    if args.a_tree_reuse && args.a_threads > 1 {
+        eprintln!("--a-tree-reuse only works with single-threaded searches; disabling");
+    }
+    if args.b_tree_reuse && args.b_threads > 1 {
+        eprintln!("--b-tree-reuse only works with single-threaded searches; disabling");
+    }
     let config_a = EngineConfig {
         iterations: args.a_iterations,
         time_ms: args.a_time_ms,
         threads: args.a_threads,
         exploration_constant: args.a_c,
         branch_all_depths: args.a_branch_all,
+        tree_reuse: args.a_tree_reuse && args.a_threads <= 1,
     };
     let config_b = EngineConfig {
         iterations: args.b_iterations,
@@ -284,6 +375,7 @@ fn main() {
         threads: args.b_threads,
         exploration_constant: args.b_c,
         branch_all_depths: args.b_branch_all,
+        tree_reuse: args.b_tree_reuse && args.b_threads <= 1,
     };
     println!("A: {}", config_a.describe());
     println!("B: {}", config_b.describe());
@@ -299,6 +391,8 @@ fn main() {
     let mut wins = 0usize;
     let mut losses = 0usize;
     let mut draws = 0usize;
+    let mut a_reuse = ReuseCounter::default();
+    let mut b_reuse = ReuseCounter::default();
     let start_time = std::time::Instant::now();
 
     for (state_index, state) in states.iter().take(state_limit).enumerate() {
@@ -323,6 +417,13 @@ fn main() {
                 } else {
                     1.0 - result.s1_score
                 };
+                if a_is_side_one {
+                    a_reuse.add(&result.s1_reuse);
+                    b_reuse.add(&result.s2_reuse);
+                } else {
+                    a_reuse.add(&result.s2_reuse);
+                    b_reuse.add(&result.s1_reuse);
+                }
                 if a_score > 0.5 {
                     wins += 1;
                 } else if a_score < 0.5 {
@@ -370,6 +471,12 @@ fn main() {
         points,
         100.0 * p
     );
+    if a_reuse.attempts > 0 {
+        println!("A tree-reuse hit rate: {}", a_reuse.describe());
+    }
+    if b_reuse.attempts > 0 {
+        println!("B tree-reuse hit rate: {}", b_reuse.describe());
+    }
 
     let clamp = |x: f64| x.clamp(0.001, 0.999);
     let elo = |p: f64| -400.0 * (1.0 / clamp(p) - 1.0).log10();
