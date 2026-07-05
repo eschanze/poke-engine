@@ -24,6 +24,13 @@ pub const DEFAULT_EXPLORATION_CONSTANT: f32 = 0.5;
 pub static BRANCH_ALL_DEPTHS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
+// When true, an expanded move pair whose every positive-weight chance outcome
+// is terminal gets an exact expected score cached at the pair level. Future
+// visits back up that expectation directly instead of resampling terminal
+// outcome children. Selfplay can flip this per side for A/B validation.
+pub static TERMINAL_PAIR_CACHE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
 // Approximate cap on tree memory, replacing the old fixed 10M iteration cap.
 // The estimate under-counts allocator overhead, so keep some headroom below
 // physical RAM.
@@ -71,6 +78,57 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-0.0125 * x).exp())
 }
 
+fn terminal_pair_score_for_nodes(state: &mut State, nodes: &mut [Node]) -> Option<f32> {
+    if !TERMINAL_PAIR_CACHE.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+
+    let mut total_weight = 0.0;
+    let mut weighted_score = 0.0;
+
+    for node in nodes.iter_mut() {
+        let weight = node.instructions.percentage.max(0.0);
+        if weight == 0.0 {
+            continue;
+        }
+
+        state.apply_instructions(&node.instructions.instruction_list);
+        let terminal_result = terminal_result_from_battle_result(state.battle_is_over());
+        node.terminal_result = terminal_result;
+        state.reverse_instructions(&node.instructions.instruction_list);
+
+        let score = terminal_score_from_cached_result(terminal_result)?;
+        total_weight += weight;
+        weighted_score += weight * score;
+    }
+
+    if total_weight > 0.0 {
+        Some(weighted_score / total_weight)
+    } else {
+        None
+    }
+}
+
+#[derive(Debug)]
+pub struct ChildBranch {
+    pub key: u32,
+    pub nodes: Box<[Node]>,
+    pub terminal_score: Option<f32>,
+}
+
+struct SelectionResult {
+    node: *mut Node,
+    s1_move: usize,
+    s2_move: usize,
+    terminal_pair_score: Option<f32>,
+}
+
+enum ExpansionResult {
+    Child(*mut Node),
+    TerminalPair(f32),
+    NoExpansion,
+}
+
 #[derive(Debug)]
 pub struct Node {
     pub root: bool,
@@ -87,10 +145,9 @@ pub struct Node {
     pub s1_options: Option<Vec<MoveNode>>,
     pub s2_options: Option<Vec<MoveNode>>,
 
-    // expanded move-pairs: (s1_idx * s2_options.len() + s2_idx, outcome
-    // branch). A linear scan beats any hash map here: most nodes only ever
-    // expand a handful of pairs, and the entries are hot in cache
-    pub children: Vec<(u32, Box<[Node]>)>,
+    // expanded move-pairs. A linear scan beats any hash map here: most nodes
+    // only ever expand a handful of pairs, and the entries are hot in cache
+    pub children: Vec<ChildBranch>,
 
     // Cached battle-over state for this node. This avoids repeatedly scanning
     // teams and, for terminal children, avoids option generation below a battle
@@ -161,13 +218,13 @@ impl Node {
         choice
     }
 
-    pub unsafe fn selection(
+    unsafe fn selection(
         &mut self,
         state: &mut State,
         rng: &mut impl Rng,
         exploration_sq: f32,
         root_force: (Option<usize>, Option<usize>),
-    ) -> (*mut Node, usize, usize) {
+    ) -> SelectionResult {
         // root_force pins one side's root move while pondering a committed
         // move; it is consumed on the first (root) step so the walk below
         // pays nothing for it
@@ -176,7 +233,12 @@ impl Node {
         loop {
             let node = &mut *current;
             if node.terminal_score(state).is_some() {
-                return (current, 0, 0);
+                return SelectionResult {
+                    node: current,
+                    s1_move: 0,
+                    s2_move: 0,
+                    terminal_pair_score: None,
+                };
             }
 
             if node.s1_options.is_none() {
@@ -200,9 +262,26 @@ impl Node {
             force = (None, None);
             let key = (s1_mc_index * node.s2_options.as_ref().unwrap().len() + s2_mc_index) as u32;
             let child_vec_ptr: *mut Box<[Node]> =
-                match node.children.iter_mut().find(|(k, _)| *k == key) {
-                    Some(entry) => &mut entry.1,
-                    None => return (current, s1_mc_index, s2_mc_index),
+                match node.children.iter_mut().find(|branch| branch.key == key) {
+                    Some(branch) => {
+                        if let Some(score) = branch.terminal_score {
+                            return SelectionResult {
+                                node: current,
+                                s1_move: s1_mc_index,
+                                s2_move: s2_mc_index,
+                                terminal_pair_score: Some(score),
+                            };
+                        }
+                        &mut branch.nodes
+                    }
+                    None => {
+                        return SelectionResult {
+                            node: current,
+                            s1_move: s1_mc_index,
+                            s2_move: s2_mc_index,
+                            terminal_pair_score: None,
+                        };
+                    }
                 };
             let chosen_child = node.sample_node(child_vec_ptr, rng);
             state.apply_instructions(&(*chosen_child).instructions.instruction_list);
@@ -231,16 +310,16 @@ impl Node {
         &mut nodes[nodes.len() - 1] as *mut Node
     }
 
-    pub unsafe fn expand(
+    unsafe fn expand(
         &mut self,
         state: &mut State,
         s1_move_index: usize,
         s2_move_index: usize,
         rng: &mut impl Rng,
         tree_bytes: &mut u64,
-    ) -> *mut Node {
+    ) -> ExpansionResult {
         if self.terminal_score(state).is_some() {
-            return self as *mut Node;
+            return ExpansionResult::NoExpansion;
         }
 
         let s1_move = &self.s1_options.as_ref().unwrap()[s1_move_index].move_choice;
@@ -248,7 +327,7 @@ impl Node {
         // if both moves are none there is no need to expand. terminal (battle
         // over) non-root nodes were already handled by terminal_score above
         if s1_move == &MoveChoice::None && s2_move == &MoveChoice::None {
-            return self as *mut Node;
+            return ExpansionResult::NoExpansion;
         }
         let should_branch_on_damage = self.root
             || (*self.parent).root
@@ -271,19 +350,28 @@ impl Node {
         // makes it a type that cannot be resized: parent pointers reference
         // nodes inside this heap slice, and while the children Vec may
         // reallocate (moving the Box), the slice itself never moves
-        let boxed = this_pair_vec.into_boxed_slice();
+        let mut boxed = this_pair_vec.into_boxed_slice();
+        let terminal_score = terminal_pair_score_for_nodes(state, &mut boxed);
         *tree_bytes += approx_branch_bytes(&boxed);
         let key = (s1_move_index * self.s2_options.as_ref().unwrap().len() + s2_move_index) as u32;
-        self.children.push((key, boxed));
+        self.children.push(ChildBranch {
+            key,
+            nodes: boxed,
+            terminal_score,
+        });
+
+        if let Some(score) = terminal_score {
+            return ExpansionResult::TerminalPair(score);
+        }
 
         // sample a node from the new branch; the rollout will be done on it
-        let branch: *mut Box<[Node]> = &mut self.children.last_mut().unwrap().1;
+        let branch: *mut Box<[Node]> = &mut self.children.last_mut().unwrap().nodes;
         let new_node_ptr = self.sample_node(branch, rng);
         state.apply_instructions(&(*new_node_ptr).instructions.instruction_list);
-        new_node_ptr
+        ExpansionResult::Child(new_node_ptr)
     }
 
-    pub unsafe fn backpropagate(&mut self, score: f32, state: &mut State) {
+    unsafe fn backpropagate(&mut self, score: f32, state: &mut State) {
         self.times_visited += 1;
         if self.root {
             return;
@@ -298,6 +386,31 @@ impl Node {
             &mut (*self.parent).s2_options.as_mut().unwrap()[self.s2_choice as usize];
         parent_s2_movenode.total_score += (1.0 - score) as f64;
         parent_s2_movenode.visits += 1;
+
+        state.reverse_instructions(&self.instructions.instruction_list);
+        (*self.parent).backpropagate(score, state);
+    }
+
+    unsafe fn backpropagate_pair(
+        &mut self,
+        score: f32,
+        state: &mut State,
+        s1_move_index: usize,
+        s2_move_index: usize,
+    ) {
+        self.times_visited += 1;
+
+        let s1_movenode = &mut self.s1_options.as_mut().unwrap()[s1_move_index];
+        s1_movenode.total_score += score as f64;
+        s1_movenode.visits += 1;
+
+        let s2_movenode = &mut self.s2_options.as_mut().unwrap()[s2_move_index];
+        s2_movenode.total_score += (1.0 - score) as f64;
+        s2_movenode.visits += 1;
+
+        if self.root {
+            return;
+        }
 
         state.reverse_instructions(&self.instructions.instruction_list);
         (*self.parent).backpropagate(score, state);
@@ -380,21 +493,58 @@ fn mcts_iteration(
     exploration_sq: f32,
     root_force: (Option<usize>, Option<usize>),
 ) {
-    let (mut new_node, s1_move, s2_move) = {
+    let selected = {
         crate::prof_scope!(crate::prof::sec::SELECTION);
         unsafe { root_node.selection(state, rng, exploration_sq, root_force) }
     };
-    new_node = {
-        crate::prof_scope!(crate::prof::sec::EXPAND);
-        unsafe { (*new_node).expand(state, s1_move, s2_move, rng, tree_bytes) }
-    };
-    let rollout_result = {
-        crate::prof_scope!(crate::prof::sec::ROLLOUT);
-        unsafe { (*new_node).rollout(state, root_eval) }
-    };
-    {
+
+    if let Some(score) = selected.terminal_pair_score {
         crate::prof_scope!(crate::prof::sec::BACKPROP);
-        unsafe { (*new_node).backpropagate(rollout_result, state) }
+        unsafe {
+            (*selected.node).backpropagate_pair(score, state, selected.s1_move, selected.s2_move)
+        }
+        return;
+    }
+
+    let expanded = {
+        crate::prof_scope!(crate::prof::sec::EXPAND);
+        unsafe {
+            (*selected.node).expand(state, selected.s1_move, selected.s2_move, rng, tree_bytes)
+        }
+    };
+
+    match expanded {
+        ExpansionResult::Child(new_node) => {
+            let rollout_result = {
+                crate::prof_scope!(crate::prof::sec::ROLLOUT);
+                unsafe { (*new_node).rollout(state, root_eval) }
+            };
+            {
+                crate::prof_scope!(crate::prof::sec::BACKPROP);
+                unsafe { (*new_node).backpropagate(rollout_result, state) }
+            }
+        }
+        ExpansionResult::TerminalPair(score) => {
+            crate::prof_scope!(crate::prof::sec::BACKPROP);
+            unsafe {
+                (*selected.node).backpropagate_pair(
+                    score,
+                    state,
+                    selected.s1_move,
+                    selected.s2_move,
+                )
+            }
+        }
+        ExpansionResult::NoExpansion => {
+            let rollout_result = {
+                crate::prof_scope!(crate::prof::sec::ROLLOUT);
+                unsafe { (*selected.node).rollout(state, root_eval) }
+            };
+            {
+                crate::prof_scope!(crate::prof::sec::BACKPROP);
+                unsafe { (*selected.node).backpropagate(rollout_result, state) }
+            }
+        }
     }
 }
 
@@ -650,10 +800,11 @@ impl ReusableTree {
                 return false;
             };
             let key = (s1_index * s2_options.len() + s2_index) as u32;
-            let Some(entry_index) = root.children.iter().position(|(k, _)| *k == key) else {
+            let Some(entry_index) = root.children.iter().position(|branch| branch.key == key)
+            else {
                 return false;
             };
-            root.children.swap_remove(entry_index).1
+            root.children.swap_remove(entry_index).nodes
         };
 
         let Some(root_index) = pick(&nodes) else {

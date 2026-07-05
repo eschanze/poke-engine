@@ -5,7 +5,7 @@ use crate::instruction::{Instruction, StateInstructions};
 use crate::mcts::{
     terminal_result_from_battle_result, terminal_score_from_cached_result, MctsResult,
     MctsSideResult, MCTS_BRANCH_ENTRY_OVERHEAD, MCTS_MAX_TREE_BYTES, MCTS_NODE_OVERHEAD,
-    TERMINAL_UNKNOWN,
+    TERMINAL_PAIR_CACHE, TERMINAL_UNKNOWN,
 };
 use crate::state::State;
 use dashmap::DashMap;
@@ -39,6 +39,38 @@ type ChildMap = DashMap<(usize, usize, usize), SharedBranch, FxBuildHasher>;
 fn sigmoid(x: f32) -> f32 {
     // Tuned so that ~200 points is very close to 1.0
     1.0 / (1.0 + (-0.0125 * x).exp())
+}
+
+fn terminal_pair_score_for_nodes(state: &mut State, nodes: &mut [Node]) -> Option<f32> {
+    if !TERMINAL_PAIR_CACHE.load(Ordering::Relaxed) {
+        return None;
+    }
+
+    let mut total_weight = 0.0;
+    let mut weighted_score = 0.0;
+
+    for node in nodes.iter_mut() {
+        let weight = node.instructions.percentage.max(0.0);
+        if weight == 0.0 {
+            continue;
+        }
+
+        state.apply_instructions(&node.instructions.instruction_list);
+        let terminal_result = terminal_result_from_battle_result(state.battle_is_over());
+        node.terminal_result
+            .store(terminal_result, Ordering::Release);
+        state.reverse_instructions(&node.instructions.instruction_list);
+
+        let score = terminal_score_from_cached_result(terminal_result)?;
+        total_weight += weight;
+        weighted_score += weight * score;
+    }
+
+    if total_weight > 0.0 {
+        Some(weighted_score / total_weight)
+    } else {
+        None
+    }
 }
 
 pub struct MoveNode {
@@ -103,6 +135,7 @@ impl SharedNodeOptions {
 pub struct SharedBranch {
     nodes: Arc<[Node]>,
     total_weight: f32,
+    terminal_score: Option<f32>,
 }
 
 impl SharedBranch {
@@ -126,6 +159,19 @@ struct PathStep {
     child: *const Node,
     s1_index: usize,
     s2_index: usize,
+}
+
+struct SelectionResult {
+    node: *const Node,
+    s1_index: usize,
+    s2_index: usize,
+    terminal_pair_score: Option<f32>,
+}
+
+enum ExpansionResult {
+    Child(*const Node),
+    TerminalPair(f32),
+    NoExpansion,
 }
 
 pub struct Node {
@@ -208,7 +254,7 @@ impl Node {
         children: &ChildMap,
         path: &mut Vec<PathStep>,
         exploration_sq: f32,
-    ) -> (*const Node, usize, usize) {
+    ) -> SelectionResult {
         // raw pointers walk both the root (a standalone Arc<Node>) and children
         // (Nodes living inside a branch's Arc<[Node]>) uniformly. every node is
         // owned by children/root for the whole search, so the pointers stay
@@ -217,7 +263,12 @@ impl Node {
         loop {
             let node = unsafe { &*current };
             if !node.root && node.terminal_score(state).is_some() {
-                return (current, 0, 0);
+                return SelectionResult {
+                    node: current,
+                    s1_index: 0,
+                    s2_index: 0,
+                    terminal_pair_score: None,
+                };
             }
 
             let (s1_index, s2_index) = node.select_move_pair(state, exploration_sq);
@@ -226,6 +277,15 @@ impl Node {
             let key = (node.as_key(), s1_index, s2_index);
             match children.get(&key) {
                 Some(branch) => {
+                    if let Some(score) = branch.terminal_score {
+                        return SelectionResult {
+                            node: current,
+                            s1_index,
+                            s2_index,
+                            terminal_pair_score: Some(score),
+                        };
+                    }
+
                     let child = branch.sample(rng);
 
                     // drop the DashMap ref before mutating state to avoid
@@ -249,7 +309,12 @@ impl Node {
                 }
                 None => {
                     // this is the leaf, stop selection
-                    return (current, s1_index, s2_index);
+                    return SelectionResult {
+                        node: current,
+                        s1_index,
+                        s2_index,
+                        terminal_pair_score: None,
+                    };
                 }
             }
         }
@@ -278,8 +343,9 @@ impl Node {
     }
 
     /// looks up or creates the child branch for `(s1_index, s2_index)` and
-    /// returns one sampled child, applying virtual loss bookkeeping.  Returns
-    /// `None` when the node should not be expanded (battle over, both-None).
+    /// returns one sampled child, or an exact terminal expectation for the
+    /// selected move pair. Returns `NoExpansion` when the node should not be
+    /// expanded (battle over, both-None).
     fn expand<R: Rng + ?Sized>(
         &self,
         state: &mut State,
@@ -288,11 +354,11 @@ impl Node {
         rng: &mut R,
         children: &ChildMap,
         tree_bytes: &AtomicU64,
-    ) -> Option<*const Node> {
+    ) -> ExpansionResult {
         // the root is exempt so that searching an already-finished battle
         // still produces move stats (same as the single-threaded searcher)
         if !self.root && self.terminal_score(state).is_some() {
-            return None;
+            return ExpansionResult::NoExpansion;
         }
 
         let options = self
@@ -303,7 +369,7 @@ impl Node {
         let s2_move = &options.s2[s2_index].move_choice;
 
         if s1_move == &MoveChoice::None && s2_move == &MoveChoice::None {
-            return None;
+            return ExpansionResult::NoExpansion;
         }
 
         let should_branch_on_damage = self.depth < MCTS_DAMAGE_BRANCH_DEPTH
@@ -312,16 +378,19 @@ impl Node {
             generate_instructions_from_move_pair(state, s1_move, s2_move, should_branch_on_damage);
 
         let mut total_weight = 0.0f32;
-        let nodes = instructions
+        let mut nodes = instructions
             .into_iter()
             .map(|instr| {
                 total_weight += instr.percentage.max(0.0);
                 Node::new_child(instr, self.depth.saturating_add(1))
             })
-            .collect::<Arc<[Node]>>();
+            .collect::<Vec<Node>>();
+        let terminal_score = terminal_pair_score_for_nodes(state, &mut nodes);
+        let nodes = nodes.into();
         let branch = SharedBranch {
             nodes,
             total_weight,
+            terminal_score,
         };
 
         let key = (self.as_key(), s1_index, s2_index);
@@ -336,7 +405,11 @@ impl Node {
             }
         };
 
-        Some(branch_ref.sample(rng))
+        if let Some(score) = branch_ref.terminal_score {
+            ExpansionResult::TerminalPair(score)
+        } else {
+            ExpansionResult::Child(branch_ref.sample(rng))
+        }
     }
 
     fn rollout(&self, state: &State, root_eval: f32) -> f32 {
@@ -365,6 +438,32 @@ impl Node {
             state.reverse_instructions(&child.instructions.instruction_list);
         }
     }
+
+    fn backpropagate_pair(
+        path: &[PathStep],
+        leaf: &Node,
+        s1_index: usize,
+        s2_index: usize,
+        score: f32,
+        state: &mut State,
+    ) {
+        let options = leaf.options.get().expect("leaf has options");
+        options.s1[s1_index].add_result(score);
+        options.s2[s2_index].add_result(1.0 - score);
+        leaf.times_visited.fetch_add(1, Ordering::AcqRel);
+
+        for step in path.iter().rev() {
+            let (parent, child) = unsafe { (&*step.parent, &*step.child) };
+            let options = parent.options.get().expect("path parent has options");
+            options.s1[step.s1_index].add_result(score);
+            options.s1[step.s1_index].remove_virtual_loss();
+            options.s2[step.s2_index].add_result(1.0 - score);
+            options.s2[step.s2_index].remove_virtual_loss();
+            parent.times_visited.fetch_add(1, Ordering::AcqRel);
+            child.virtual_losses.fetch_sub(1, Ordering::AcqRel);
+            state.reverse_instructions(&child.instructions.instruction_list);
+        }
+    }
 }
 
 fn mcts_iteration<R: Rng + ?Sized>(
@@ -379,9 +478,20 @@ fn mcts_iteration<R: Rng + ?Sized>(
 ) {
     path.clear();
 
-    let (leaf, s1_index, s2_index) =
-        Node::selection(root, state, rng, children, path, exploration_sq);
-    let leaf = unsafe { &*leaf };
+    let selected = Node::selection(root, state, rng, children, path, exploration_sq);
+    let leaf = unsafe { &*selected.node };
+
+    if let Some(score) = selected.terminal_pair_score {
+        Node::backpropagate_pair(
+            path,
+            leaf,
+            selected.s1_index,
+            selected.s2_index,
+            score,
+            state,
+        );
+        return;
+    }
 
     if !leaf.root {
         if let Some(score) = leaf.terminal_score(state) {
@@ -391,19 +501,26 @@ fn mcts_iteration<R: Rng + ?Sized>(
     }
 
     let options = leaf.options.get().expect("options set during selection");
-    options.s1[s1_index].add_virtual_loss();
-    options.s2[s2_index].add_virtual_loss();
-    let expanded = leaf.expand(state, s1_index, s2_index, rng, children, tree_bytes);
+    options.s1[selected.s1_index].add_virtual_loss();
+    options.s2[selected.s2_index].add_virtual_loss();
+    let expanded = leaf.expand(
+        state,
+        selected.s1_index,
+        selected.s2_index,
+        rng,
+        children,
+        tree_bytes,
+    );
     match expanded {
-        Some(child) => {
+        ExpansionResult::Child(child) => {
             let child = unsafe { &*child };
             child.virtual_losses.fetch_add(1, Ordering::AcqRel);
             state.apply_instructions(&child.instructions.instruction_list);
             path.push(PathStep {
                 parent: leaf,
                 child,
-                s1_index,
-                s2_index,
+                s1_index: selected.s1_index,
+                s2_index: selected.s2_index,
             });
 
             let score = child.rollout(state, root_eval);
@@ -411,14 +528,28 @@ fn mcts_iteration<R: Rng + ?Sized>(
             Node::backpropagate(path, child, score, state);
         }
 
+        ExpansionResult::TerminalPair(score) => {
+            options.s1[selected.s1_index].remove_virtual_loss();
+            options.s2[selected.s2_index].remove_virtual_loss();
+
+            Node::backpropagate_pair(
+                path,
+                leaf,
+                selected.s1_index,
+                selected.s2_index,
+                score,
+                state,
+            );
+        }
+
         // if expansion returns None,
         // the battle is either over or both sides have no valid moves
         // so no child is added to the tree
         // we do a rollout on the leaf and backpropagate without adding a child to the tree
-        None => {
+        ExpansionResult::NoExpansion => {
             // remove the virtual loss we added before expansion, since we're not actually expanding
-            options.s1[s1_index].remove_virtual_loss();
-            options.s2[s2_index].remove_virtual_loss();
+            options.s1[selected.s1_index].remove_virtual_loss();
+            options.s2[selected.s2_index].remove_virtual_loss();
 
             let score = leaf.rollout(state, root_eval);
 

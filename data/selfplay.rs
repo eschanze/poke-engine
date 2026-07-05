@@ -51,6 +51,9 @@ struct Args {
     /// A branches on damage rolls/crits at every depth (pass =false for 2-ply-only)
     #[clap(long, action = clap::ArgAction::Set, default_value_t = true)]
     a_branch_all: bool,
+    /// A caches exact terminal expectations for fully-terminal move pairs
+    #[clap(long, action = clap::ArgAction::Set, default_value_t = true)]
+    a_terminal_pair_cache: bool,
     /// A keeps its search tree across turns (single-threaded searches only)
     #[clap(long, action = clap::ArgAction::Set, default_value_t = false)]
     a_tree_reuse: bool,
@@ -71,6 +74,9 @@ struct Args {
     /// B branches on damage rolls/crits at every depth (pass =false for 2-ply-only)
     #[clap(long, action = clap::ArgAction::Set, default_value_t = true)]
     b_branch_all: bool,
+    /// B caches exact terminal expectations for fully-terminal move pairs
+    #[clap(long, action = clap::ArgAction::Set, default_value_t = true)]
+    b_terminal_pair_cache: bool,
     /// B keeps its search tree across turns (single-threaded searches only)
     #[clap(long, action = clap::ArgAction::Set, default_value_t = false)]
     b_tree_reuse: bool,
@@ -87,6 +93,7 @@ struct EngineConfig {
     threads: usize,
     exploration_constant: f32,
     branch_all_depths: bool,
+    terminal_pair_cache: bool,
     tree_reuse: bool,
     ponder_iterations: u32,
 }
@@ -94,12 +101,13 @@ struct EngineConfig {
 impl EngineConfig {
     fn describe(&self) -> String {
         format!(
-            "iterations={} time_ms={} threads={} c={} branch_all={} tree_reuse={} ponder={}",
+            "iterations={} time_ms={} threads={} c={} branch_all={} terminal_pair_cache={} tree_reuse={} ponder={}",
             self.iterations,
             self.time_ms,
             self.threads,
             self.exploration_constant,
             self.branch_all_depths,
+            self.terminal_pair_cache,
             self.tree_reuse,
             self.ponder_iterations
         )
@@ -135,6 +143,10 @@ fn pick_move(
     // searches run sequentially, so a process-global knob is safe here
     poke_engine::mcts::BRANCH_ALL_DEPTHS.store(
         config.branch_all_depths,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    poke_engine::mcts::TERMINAL_PAIR_CACHE.store(
+        config.terminal_pair_cache,
         std::sync::atomic::Ordering::Relaxed,
     );
     let max_time = Duration::from_millis(config.time_ms);
@@ -188,6 +200,10 @@ fn ponder(
     }
     poke_engine::mcts::BRANCH_ALL_DEPTHS.store(
         config.branch_all_depths,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    poke_engine::mcts::TERMINAL_PAIR_CACHE.store(
+        config.terminal_pair_cache,
         std::sync::atomic::Ordering::Relaxed,
     );
     let (s1_options, s2_options) = state.root_get_all_options();
@@ -428,6 +444,7 @@ fn main() {
         threads: args.a_threads,
         exploration_constant: args.a_c,
         branch_all_depths: args.a_branch_all,
+        terminal_pair_cache: args.a_terminal_pair_cache,
         tree_reuse: a_tree_reuse && args.a_threads <= 1,
         ponder_iterations: args.a_ponder_iterations,
     };
@@ -437,6 +454,7 @@ fn main() {
         threads: args.b_threads,
         exploration_constant: args.b_c,
         branch_all_depths: args.b_branch_all,
+        terminal_pair_cache: args.b_terminal_pair_cache,
         tree_reuse: b_tree_reuse && args.b_threads <= 1,
         ponder_iterations: args.b_ponder_iterations,
     };
