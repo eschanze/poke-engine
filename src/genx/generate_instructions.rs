@@ -972,6 +972,12 @@ fn get_instructions_from_secondaries(
     hit_sub: bool,
 ) -> Vec<StateInstructions> {
     crate::prof_scope!(crate::prof::sec::SECONDARIES);
+    // `run_move` leaves the main move's instructions applied while this
+    // function branches its secondary effects. Replaying that common prefix
+    // for every branch used to account for a large fraction of this path's
+    // apply/reverse churn. Each branch only needs to replay the secondary
+    // suffix that distinguishes it from the already-applied prefix.
+    let base_instruction_len = incoming_instructions.instruction_list.len();
     let mut return_instruction_list = Vec::with_capacity(4);
     return_instruction_list.push(incoming_instructions);
 
@@ -995,7 +1001,9 @@ fn get_instructions_from_secondaries(
             if secondary_percent_hit > 0.0 {
                 secondary_hit_instructions.update_percentage(secondary_percent_hit);
 
-                state.apply_instructions(&secondary_hit_instructions.instruction_list);
+                state.apply_instructions(
+                    &secondary_hit_instructions.instruction_list[base_instruction_len..],
+                );
                 match &secondary.effect {
                     Effect::VolatileStatus(volatile_status) => {
                         get_instructions_from_volatile_statuses(
@@ -1064,7 +1072,9 @@ fn get_instructions_from_secondaries(
                         target_pkmn.item = Items::NONE;
                     }
                 }
-                state.reverse_instructions(&secondary_hit_instructions.instruction_list);
+                state.reverse_instructions(
+                    &secondary_hit_instructions.instruction_list[base_instruction_len..],
+                );
                 return_instruction_list.insert(i, secondary_hit_instructions);
                 i += 1; // Increment i only if we didn't remove an element
             }
@@ -3733,7 +3743,7 @@ fn run_move(
         state.reverse_instructions(&instructions.instruction_list);
         final_instructions.push(instructions);
     } else if let Some(secondaries_vec) = &choice.secondaries {
-        state.reverse_instructions(&instructions.instruction_list);
+        let main_instruction_len = instructions.instruction_list.len();
         let instructions_vec_after_secondaries = get_instructions_from_secondaries(
             state,
             &choice,
@@ -3741,6 +3751,9 @@ fn run_move(
             &attacking_side,
             instructions,
             hit_sub,
+        );
+        state.reverse_instructions(
+            &instructions_vec_after_secondaries[0].instruction_list[..main_instruction_len],
         );
         final_instructions.extend(instructions_vec_after_secondaries);
     } else {
@@ -5489,6 +5502,7 @@ mod tests {
     #[test]
     fn test_move_with_multiple_secondaries() {
         let mut state: State = State::default();
+        let original_state = state.serialize();
         let mut choice = MOVES.get(&Choices::FIREFANG).unwrap().to_owned();
 
         let mut instructions = vec![];
@@ -5563,7 +5577,8 @@ mod tests {
             },
         ];
 
-        assert_eq!(instructions, expected_instructions)
+        assert_eq!(instructions, expected_instructions);
+        assert_eq!(state.serialize(), original_state);
     }
 
     #[test]
