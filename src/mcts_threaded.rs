@@ -1,4 +1,4 @@
-use crate::engine::evaluate::evaluate;
+use crate::engine::evaluate::{evaluate_with_config, EvalConfig};
 use crate::engine::generate_instructions::generate_instructions_from_move_pair;
 use crate::engine::state::MoveChoice;
 use crate::instruction::{Instruction, StateInstructions};
@@ -412,11 +412,11 @@ impl Node {
         }
     }
 
-    fn rollout(&self, state: &State, root_eval: f32) -> f32 {
+    fn rollout(&self, state: &State, root_eval: f32, eval_config: EvalConfig) -> f32 {
         if let Some(score) = self.terminal_score(state) {
             score
         } else {
-            sigmoid(evaluate(state) - root_eval)
+            sigmoid(evaluate_with_config(state, eval_config) - root_eval)
         }
     }
 
@@ -475,6 +475,7 @@ fn mcts_iteration<R: Rng + ?Sized>(
     path: &mut Vec<PathStep>,
     tree_bytes: &AtomicU64,
     exploration_sq: f32,
+    eval_config: EvalConfig,
 ) {
     path.clear();
 
@@ -523,7 +524,7 @@ fn mcts_iteration<R: Rng + ?Sized>(
                 s2_index: selected.s2_index,
             });
 
-            let score = child.rollout(state, root_eval);
+            let score = child.rollout(state, root_eval, eval_config);
 
             Node::backpropagate(path, child, score, state);
         }
@@ -551,7 +552,7 @@ fn mcts_iteration<R: Rng + ?Sized>(
             options.s1[selected.s1_index].remove_virtual_loss();
             options.s2[selected.s2_index].remove_virtual_loss();
 
-            let score = leaf.rollout(state, root_eval);
+            let score = leaf.rollout(state, root_eval, eval_config);
 
             Node::backpropagate(path, leaf, score, state);
         }
@@ -575,6 +576,7 @@ fn run_mcts_loop(
     deadline: Instant,
     search_limit: SearchLimit,
     exploration_sq: f32,
+    eval_config: EvalConfig,
 ) {
     // SmallRng is much cheaper than the default crypto-grade ThreadRng and
     // statistical quality is all that matters here
@@ -592,6 +594,7 @@ fn run_mcts_loop(
                 &mut path,
                 &tree_bytes,
                 exploration_sq,
+                eval_config,
             );
             current_iterations = started_iterations.fetch_add(1, Ordering::AcqRel);
         }
@@ -618,17 +621,18 @@ fn run_mcts_loop(
     }
 }
 
-pub fn perform_mcts_shared_tree(
+pub fn perform_mcts_shared_tree_with_eval(
     state: &mut State,
     side_one_options: Vec<MoveChoice>,
     side_two_options: Vec<MoveChoice>,
+    eval_config: EvalConfig,
     max_time: Duration,
     max_iterations: u32,
     worker_count: usize,
     exploration_constant: f32,
 ) -> MctsResult {
     let exploration_sq = exploration_constant * exploration_constant;
-    let root_eval = evaluate(state);
+    let root_eval = evaluate_with_config(state, eval_config);
     let deadline = Instant::now() + max_time;
     let root = Node::new_root(side_one_options, side_two_options);
     let started_iterations = Arc::new(AtomicU64::new(0));
@@ -663,6 +667,7 @@ pub fn perform_mcts_shared_tree(
                     deadline,
                     search_limit,
                     exploration_sq,
+                    eval_config,
                 );
             });
         }
@@ -690,4 +695,25 @@ pub fn perform_mcts_shared_tree(
             .collect(),
         iteration_count: root.times_visited.load(Ordering::Acquire),
     }
+}
+
+pub fn perform_mcts_shared_tree(
+    state: &mut State,
+    side_one_options: Vec<MoveChoice>,
+    side_two_options: Vec<MoveChoice>,
+    max_time: Duration,
+    max_iterations: u32,
+    worker_count: usize,
+    exploration_constant: f32,
+) -> MctsResult {
+    perform_mcts_shared_tree_with_eval(
+        state,
+        side_one_options,
+        side_two_options,
+        EvalConfig::default(),
+        max_time,
+        max_iterations,
+        worker_count,
+        exploration_constant,
+    )
 }

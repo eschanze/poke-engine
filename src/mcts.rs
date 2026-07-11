@@ -1,4 +1,4 @@
-use crate::engine::evaluate::evaluate;
+use crate::engine::evaluate::{evaluate_with_config, EvalConfig};
 use crate::engine::generate_instructions::generate_instructions_from_move_pair;
 use crate::engine::state::MoveChoice;
 use crate::instruction::{Instruction, StateInstructions};
@@ -416,7 +416,7 @@ impl Node {
         (*self.parent).backpropagate(score, state);
     }
 
-    pub fn rollout(&mut self, state: &mut State, root_eval: &f32) -> f32 {
+    pub fn rollout(&mut self, state: &mut State, root_eval: &f32, eval_config: EvalConfig) -> f32 {
         if self.root {
             if let Some(score) = terminal_score_from_cached_result(
                 terminal_result_from_battle_result(state.battle_is_over()),
@@ -427,7 +427,7 @@ impl Node {
             return score;
         }
 
-        let eval = evaluate(state);
+        let eval = evaluate_with_config(state, eval_config);
         sigmoid(eval - root_eval)
     }
 }
@@ -492,6 +492,7 @@ fn mcts_iteration(
     tree_bytes: &mut u64,
     exploration_sq: f32,
     root_force: (Option<usize>, Option<usize>),
+    eval_config: EvalConfig,
 ) {
     let selected = {
         crate::prof_scope!(crate::prof::sec::SELECTION);
@@ -517,7 +518,7 @@ fn mcts_iteration(
         ExpansionResult::Child(new_node) => {
             let rollout_result = {
                 crate::prof_scope!(crate::prof::sec::ROLLOUT);
-                unsafe { (*new_node).rollout(state, root_eval) }
+                unsafe { (*new_node).rollout(state, root_eval, eval_config) }
             };
             {
                 crate::prof_scope!(crate::prof::sec::BACKPROP);
@@ -538,7 +539,7 @@ fn mcts_iteration(
         ExpansionResult::NoExpansion => {
             let rollout_result = {
                 crate::prof_scope!(crate::prof::sec::ROLLOUT);
-                unsafe { (*selected.node).rollout(state, root_eval) }
+                unsafe { (*selected.node).rollout(state, root_eval, eval_config) }
             };
             {
                 crate::prof_scope!(crate::prof::sec::BACKPROP);
@@ -563,6 +564,7 @@ fn run_mcts_loop(
     exploration_sq: f32,
     start_visits: u64,
     root_force: (Option<usize>, Option<usize>),
+    eval_config: EvalConfig,
 ) {
     // SmallRng is much cheaper than the default crypto-grade ThreadRng and
     // statistical quality is all that matters here
@@ -579,6 +581,7 @@ fn run_mcts_loop(
                 &mut tree_bytes,
                 exploration_sq,
                 root_force,
+                eval_config,
             );
         }
         if tree_bytes >= MCTS_MAX_TREE_BYTES {
@@ -700,6 +703,7 @@ const MAX_ANCHOR_DRIFT: f32 = 150.0;
 pub struct ReusableTree {
     storage: Option<TreeStorage>,
     anchor_eval: f32,
+    eval_config: EvalConfig,
 }
 
 impl ReusableTree {
@@ -707,6 +711,7 @@ impl ReusableTree {
         ReusableTree {
             storage: None,
             anchor_eval: 0.0,
+            eval_config: EvalConfig::default(),
         }
     }
 
@@ -869,6 +874,7 @@ fn options_match(
 fn ensure_root(
     tree: &mut ReusableTree,
     current_eval: f32,
+    eval_config: EvalConfig,
     side_one_options: Vec<MoveChoice>,
     side_two_options: Vec<MoveChoice>,
 ) {
@@ -876,6 +882,7 @@ fn ensure_root(
         Some(storage) => {
             options_match(storage.root_ref(), &side_one_options, &side_two_options)
                 && (current_eval - tree.anchor_eval).abs() <= MAX_ANCHOR_DRIFT
+                && tree.eval_config == eval_config
         }
         None => false,
     };
@@ -887,6 +894,7 @@ fn ensure_root(
         }
         tree.storage = Some(TreeStorage::Fresh(root_node));
         tree.anchor_eval = current_eval;
+        tree.eval_config = eval_config;
     }
 }
 
@@ -894,16 +902,23 @@ fn ensure_root(
 /// caller's option lists (as after a successful [`ReusableTree::advance`]);
 /// otherwise the tree is replaced with a fresh root. Iteration limits and the
 /// returned `iteration_count` count only this call's iterations.
-pub fn perform_mcts_with_tree(
+pub fn perform_mcts_with_tree_and_eval(
     tree: &mut ReusableTree,
     state: &mut State,
     side_one_options: Vec<MoveChoice>,
     side_two_options: Vec<MoveChoice>,
+    eval_config: EvalConfig,
     max_time: Duration,
     max_iterations: u32,
     exploration_constant: f32,
 ) -> MctsResult {
-    ensure_root(tree, evaluate(state), side_one_options, side_two_options);
+    ensure_root(
+        tree,
+        evaluate_with_config(state, eval_config),
+        eval_config,
+        side_one_options,
+        side_two_options,
+    );
 
     let root_node = tree.storage.as_mut().unwrap().root_mut();
     let start_visits = root_node.times_visited;
@@ -916,9 +931,31 @@ pub fn perform_mcts_with_tree(
         exploration_constant * exploration_constant,
         start_visits,
         (None, None),
+        eval_config,
     );
 
     collect_result(root_node, root_node.times_visited - start_visits)
+}
+
+pub fn perform_mcts_with_tree(
+    tree: &mut ReusableTree,
+    state: &mut State,
+    side_one_options: Vec<MoveChoice>,
+    side_two_options: Vec<MoveChoice>,
+    max_time: Duration,
+    max_iterations: u32,
+    exploration_constant: f32,
+) -> MctsResult {
+    perform_mcts_with_tree_and_eval(
+        tree,
+        state,
+        side_one_options,
+        side_two_options,
+        EvalConfig::default(),
+        max_time,
+        max_iterations,
+        exploration_constant,
+    )
 }
 
 /// Ponder: search with `ponder_side`'s root move pinned to `committed_move`.
@@ -928,18 +965,25 @@ pub fn perform_mcts_with_tree(
 /// an opponent prediction. Below the root the search is unrestricted. If
 /// `committed_move` is not among the root's options the search runs
 /// unrestricted (equivalent to [`perform_mcts_with_tree`]).
-pub fn perform_mcts_ponder(
+pub fn perform_mcts_ponder_with_eval(
     tree: &mut ReusableTree,
     state: &mut State,
     side_one_options: Vec<MoveChoice>,
     side_two_options: Vec<MoveChoice>,
     ponder_side: SideReference,
     committed_move: &MoveChoice,
+    eval_config: EvalConfig,
     max_time: Duration,
     max_iterations: u32,
     exploration_constant: f32,
 ) -> MctsResult {
-    ensure_root(tree, evaluate(state), side_one_options, side_two_options);
+    ensure_root(
+        tree,
+        evaluate_with_config(state, eval_config),
+        eval_config,
+        side_one_options,
+        side_two_options,
+    );
 
     let root_node = tree.storage.as_mut().unwrap().root_mut();
     let committed_index = |options: &Option<Vec<MoveNode>>| {
@@ -964,9 +1008,35 @@ pub fn perform_mcts_ponder(
         exploration_constant * exploration_constant,
         start_visits,
         root_force,
+        eval_config,
     );
 
     collect_result(root_node, root_node.times_visited - start_visits)
+}
+
+pub fn perform_mcts_ponder(
+    tree: &mut ReusableTree,
+    state: &mut State,
+    side_one_options: Vec<MoveChoice>,
+    side_two_options: Vec<MoveChoice>,
+    ponder_side: SideReference,
+    committed_move: &MoveChoice,
+    max_time: Duration,
+    max_iterations: u32,
+    exploration_constant: f32,
+) -> MctsResult {
+    perform_mcts_ponder_with_eval(
+        tree,
+        state,
+        side_one_options,
+        side_two_options,
+        ponder_side,
+        committed_move,
+        EvalConfig::default(),
+        max_time,
+        max_iterations,
+        exploration_constant,
+    )
 }
 
 pub fn perform_mcts(
@@ -977,12 +1047,33 @@ pub fn perform_mcts(
     max_iterations: u32,
     exploration_constant: f32,
 ) -> MctsResult {
+    perform_mcts_with_eval(
+        state,
+        side_one_options,
+        side_two_options,
+        EvalConfig::default(),
+        max_time,
+        max_iterations,
+        exploration_constant,
+    )
+}
+
+pub fn perform_mcts_with_eval(
+    state: &mut State,
+    side_one_options: Vec<MoveChoice>,
+    side_two_options: Vec<MoveChoice>,
+    eval_config: EvalConfig,
+    max_time: Duration,
+    max_iterations: u32,
+    exploration_constant: f32,
+) -> MctsResult {
     let mut tree = ReusableTree::new();
-    perform_mcts_with_tree(
+    perform_mcts_with_tree_and_eval(
         &mut tree,
         state,
         side_one_options,
         side_two_options,
+        eval_config,
         max_time,
         max_iterations,
         exploration_constant,

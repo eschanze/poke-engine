@@ -3,6 +3,13 @@ use super::state::PokemonVolatileStatus;
 use crate::choices::MoveCategory;
 use crate::state::{Pokemon, PokemonStatus, State};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct EvalConfig;
+
+pub fn evaluate_with_config(state: &State, _config: EvalConfig) -> f32 {
+    evaluate(state)
+}
+
 const POKEMON_ALIVE: f32 = 30.0;
 const POKEMON_HP: f32 = 100.0;
 

@@ -1,11 +1,12 @@
 #![cfg(not(any(feature = "gen1", feature = "gen2", feature = "gen3")))]
 
+use poke_engine::engine::evaluate::{EvalConfig, DEFAULT_EVAL_WEIGHTS};
 use poke_engine::engine::generate_instructions::generate_instructions_from_move_pair;
 use poke_engine::engine::state::MoveChoice;
 use poke_engine::instruction::Instruction;
 use poke_engine::mcts::{
-    perform_mcts_ponder, perform_mcts_with_tree, MctsSideResult, ReusableTree,
-    DEFAULT_EXPLORATION_CONSTANT,
+    perform_mcts_ponder, perform_mcts_with_tree, perform_mcts_with_tree_and_eval, MctsSideResult,
+    ReusableTree, DEFAULT_EXPLORATION_CONSTANT,
 };
 use poke_engine::state::{SideReference, State};
 use std::time::Duration;
@@ -224,4 +225,37 @@ fn test_advance_mismatch_clears_the_tree() {
     );
     assert_eq!(result.iteration_count, 5000);
     assert_eq!(tree.root_visits(), 5000);
+}
+
+#[test]
+fn test_changing_eval_config_discards_reusable_tree_statistics() {
+    let mut state = first_bundled_state();
+    let mut tree = ReusableTree::new();
+    let (s1_options, s2_options) = state.root_get_all_options();
+
+    perform_mcts_with_tree(
+        &mut tree,
+        &mut state,
+        s1_options.clone(),
+        s2_options.clone(),
+        Duration::ZERO,
+        1000,
+        DEFAULT_EXPLORATION_CONSTANT,
+    );
+    assert_eq!(tree.root_visits(), 1000);
+
+    let linear_config = EvalConfig::new(&DEFAULT_EVAL_WEIGHTS, false);
+    let result = perform_mcts_with_tree_and_eval(
+        &mut tree,
+        &mut state,
+        s1_options,
+        s2_options,
+        linear_config,
+        Duration::ZERO,
+        1000,
+        DEFAULT_EXPLORATION_CONSTANT,
+    );
+
+    assert_eq!(result.iteration_count, 1000);
+    assert_eq!(tree.root_visits(), 1000, "config change must cold-start");
 }

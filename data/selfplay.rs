@@ -3,15 +3,59 @@ use poke_engine::engine::generate_instructions::generate_instructions_from_move_
 use poke_engine::engine::state::MoveChoice;
 use poke_engine::instruction::StateInstructions;
 use poke_engine::mcts::{
-    perform_mcts, perform_mcts_ponder, perform_mcts_with_tree, MctsSideResult, ReusableTree,
-    DEFAULT_EXPLORATION_CONSTANT,
+    perform_mcts_ponder_with_eval, perform_mcts_with_eval, perform_mcts_with_tree_and_eval,
+    MctsSideResult, ReusableTree, DEFAULT_EXPLORATION_CONSTANT,
 };
-use poke_engine::mcts_threaded::perform_mcts_shared_tree;
+use poke_engine::mcts_threaded::perform_mcts_shared_tree_with_eval;
 use poke_engine::state::{SideReference, State};
 use rand::prelude::*;
 use rand::rngs::SmallRng;
+use std::io::Write;
 use std::process::exit;
 use std::time::Duration;
+
+// Eval weight files and trajectory features only exist for the genx engine;
+// these shims keep gen1-3 builds compiling (the flags error out / no-op there).
+#[cfg(not(any(feature = "gen1", feature = "gen2", feature = "gen3")))]
+mod eval_api {
+    pub use poke_engine::engine::evaluate::{
+        eval_feature_schema, eval_features, parse_eval_weights, EvalConfig, DEFAULT_EVAL_WEIGHTS,
+        NUM_EVAL_FEATURES,
+    };
+
+    pub const TUNING_SUPPORTED: bool = true;
+
+    pub fn config(
+        weights: Option<&'static [f32; NUM_EVAL_FEATURES]>,
+        mon_clamp: bool,
+    ) -> EvalConfig {
+        EvalConfig::new(weights.unwrap_or(&DEFAULT_EVAL_WEIGHTS), mon_clamp)
+    }
+}
+
+#[cfg(any(feature = "gen1", feature = "gen2", feature = "gen3"))]
+mod eval_api {
+    pub use poke_engine::engine::evaluate::EvalConfig;
+
+    pub const NUM_EVAL_FEATURES: usize = 0;
+    pub const TUNING_SUPPORTED: bool = false;
+
+    pub fn parse_eval_weights(_text: &str) -> Result<[f32; NUM_EVAL_FEATURES], String> {
+        Err("eval weight files are only supported for gen4+ builds".to_string())
+    }
+    pub fn eval_features(_state: &poke_engine::state::State) -> [f32; NUM_EVAL_FEATURES] {
+        []
+    }
+    pub fn eval_feature_schema() -> String {
+        "unsupported".to_string()
+    }
+    pub fn config(
+        _weights: Option<&'static [f32; NUM_EVAL_FEATURES]>,
+        _mon_clamp: bool,
+    ) -> EvalConfig {
+        EvalConfig
+    }
+}
 
 // Self-play A/B harness. See SELFPLAY_PLAN.md for design rationale.
 //
@@ -39,6 +83,11 @@ struct Args {
     #[clap(short = 'v', long, default_value_t = false)]
     verbose: bool,
 
+    /// dump every visited position as JSONL (state, eval features, outcome)
+    /// for eval tuning — see EVAL_TUNING_PLAN.md and tools/eval_tuning
+    #[clap(long)]
+    dump_trajectories: Option<String>,
+
     #[clap(long, default_value_t = 20000)]
     a_iterations: u32,
     #[clap(long, default_value_t = 0)]
@@ -61,6 +110,13 @@ struct Args {
     /// move (simulated pondering; implies --a-tree-reuse)
     #[clap(long, default_value_t = 0)]
     a_ponder_iterations: u32,
+    /// eval weights file for A (default: built-in constants; gen4+ only)
+    #[clap(long)]
+    a_eval_weights: Option<String>,
+    /// whether A clamps negative per-mon eval subtotals; pass false for a
+    /// fully linear tuning experiment
+    #[clap(long, action = clap::ArgAction::Set, default_value_t = true, value_name = "BOOL")]
+    a_eval_clamp: bool,
 
     #[clap(long, default_value_t = 20000)]
     b_iterations: u32,
@@ -84,6 +140,13 @@ struct Args {
     /// move (simulated pondering; implies --b-tree-reuse)
     #[clap(long, default_value_t = 0)]
     b_ponder_iterations: u32,
+    /// eval weights file for B (default: built-in constants; gen4+ only)
+    #[clap(long)]
+    b_eval_weights: Option<String>,
+    /// whether B clamps negative per-mon eval subtotals; pass false for a
+    /// fully linear tuning experiment
+    #[clap(long, action = clap::ArgAction::Set, default_value_t = true, value_name = "BOOL")]
+    b_eval_clamp: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -96,12 +159,16 @@ struct EngineConfig {
     terminal_pair_cache: bool,
     tree_reuse: bool,
     ponder_iterations: u32,
+    eval_config: eval_api::EvalConfig,
+    /// file the weights came from, for reporting only
+    eval_weights_name: &'static str,
+    eval_clamp: bool,
 }
 
 impl EngineConfig {
     fn describe(&self) -> String {
         format!(
-            "iterations={} time_ms={} threads={} c={} branch_all={} terminal_pair_cache={} tree_reuse={} ponder={}",
+            "iterations={} time_ms={} threads={} c={} branch_all={} terminal_pair_cache={} tree_reuse={} ponder={} eval_weights={} eval_clamp={}",
             self.iterations,
             self.time_ms,
             self.threads,
@@ -109,7 +176,9 @@ impl EngineConfig {
             self.branch_all_depths,
             self.terminal_pair_cache,
             self.tree_reuse,
-            self.ponder_iterations
+            self.ponder_iterations,
+            self.eval_weights_name,
+            self.eval_clamp
         )
     }
 }
@@ -140,7 +209,8 @@ fn pick_move(
         _ => {}
     }
 
-    // searches run sequentially, so a process-global knob is safe here
+    // These existing MCTS knobs are process-global; self-play searches are
+    // sequential, while evaluation configuration is passed per search.
     poke_engine::mcts::BRANCH_ALL_DEPTHS.store(
         config.branch_all_depths,
         std::sync::atomic::Ordering::Relaxed,
@@ -151,30 +221,33 @@ fn pick_move(
     );
     let max_time = Duration::from_millis(config.time_ms);
     let result = if config.threads > 1 {
-        perform_mcts_shared_tree(
+        perform_mcts_shared_tree_with_eval(
             state,
             s1_options,
             s2_options,
+            config.eval_config,
             max_time,
             config.iterations,
             config.threads,
             config.exploration_constant,
         )
     } else if config.tree_reuse {
-        perform_mcts_with_tree(
+        perform_mcts_with_tree_and_eval(
             tree,
             state,
             s1_options,
             s2_options,
+            config.eval_config,
             max_time,
             config.iterations,
             config.exploration_constant,
         )
     } else {
-        perform_mcts(
+        perform_mcts_with_eval(
             state,
             s1_options,
             s2_options,
+            config.eval_config,
             max_time,
             config.iterations,
             config.exploration_constant,
@@ -211,13 +284,14 @@ fn ponder(
         SideRole::SideOne => SideReference::SideOne,
         SideRole::SideTwo => SideReference::SideTwo,
     };
-    perform_mcts_ponder(
+    perform_mcts_ponder_with_eval(
         tree,
         state,
         s1_options,
         s2_options,
         ponder_side,
         committed,
+        config.eval_config,
         Duration::ZERO,
         config.ponder_iterations,
         config.exploration_constant,
@@ -298,6 +372,87 @@ struct GameResult {
     s2_reuse: ReuseCounter,
 }
 
+/// one decision point of a game, buffered until the outcome is known
+struct TrajectoryPosition {
+    turn: usize,
+    state: String,
+    features: [f32; eval_api::NUM_EVAL_FEATURES],
+}
+
+struct TrajectoryDump {
+    writer: std::io::BufWriter<std::fs::File>,
+    feature_schema: String,
+    game_id: usize,
+    positions_written: usize,
+    positions_skipped: usize,
+}
+
+impl TrajectoryDump {
+    fn create(path: &str) -> TrajectoryDump {
+        let file = std::fs::File::create(path).expect("failed to create trajectory dump file");
+        TrajectoryDump {
+            writer: std::io::BufWriter::new(file),
+            feature_schema: eval_api::eval_feature_schema(),
+            game_id: 0,
+            positions_written: 0,
+            positions_skipped: 0,
+        }
+    }
+
+    fn write_game(
+        &mut self,
+        state_index: usize,
+        s1_outcome: f64,
+        truncated: bool,
+        positions: &[TrajectoryPosition],
+    ) {
+        for position in positions {
+            // degenerate states (e.g. a mon with maxhp 0 in the bundled data)
+            // produce non-finite features; they would corrupt the JSON and
+            // the fit, so drop them
+            if position.features.iter().any(|f| !f.is_finite()) {
+                self.positions_skipped += 1;
+                continue;
+            }
+            let mut features = String::with_capacity(eval_api::NUM_EVAL_FEATURES * 8);
+            features.push('[');
+            for (i, f) in position.features.iter().enumerate() {
+                if i > 0 {
+                    features.push(',');
+                }
+                features.push_str(&format!("{}", f));
+            }
+            features.push(']');
+            let state = position.state.replace('\\', "\\\\").replace('"', "\\\"");
+            writeln!(
+                self.writer,
+                "{{\"feature_schema\":\"{}\",\"game_id\":{},\"state_index\":{},\"turn\":{},\"outcome\":{},\"truncated\":{},\"features\":{},\"state\":\"{}\"}}",
+                self.feature_schema,
+                self.game_id,
+                state_index,
+                position.turn,
+                s1_outcome,
+                truncated,
+                features,
+                state
+            )
+            .expect("failed to write trajectory dump");
+            self.positions_written += 1;
+        }
+        self.game_id += 1;
+    }
+
+    fn finish(mut self) {
+        self.writer
+            .flush()
+            .expect("failed to flush trajectory dump");
+        println!(
+            "trajectory dump: {} games, {} positions ({} skipped as non-finite)",
+            self.game_id, self.positions_written, self.positions_skipped
+        );
+    }
+}
+
 fn play_game(
     initial_state: &State,
     s1_config: &EngineConfig,
@@ -305,6 +460,7 @@ fn play_game(
     max_turns: usize,
     verbose: bool,
     rng: &mut SmallRng,
+    mut trace: Option<&mut Vec<TrajectoryPosition>>,
 ) -> GameResult {
     let mut state = initial_state.clone();
     let mut decisions = 0;
@@ -323,6 +479,14 @@ fn play_game(
                 s1_reuse,
                 s2_reuse,
             };
+        }
+
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.push(TrajectoryPosition {
+                turn: decisions,
+                state: state.serialize(),
+                features: eval_api::eval_features(&state),
+            });
         }
 
         let s1_choice = pick_move(&mut state, s1_config, &SideRole::SideOne, &mut s1_tree);
@@ -408,6 +572,10 @@ fn main() {
         eprintln!("File name is required");
         exit(1);
     }
+    if args.dump_trajectories.is_some() && !eval_api::TUNING_SUPPORTED {
+        eprintln!("trajectory dumps are only supported for gen4+ builds");
+        exit(1);
+    }
 
     let file_path = {
         let this_file = std::path::Path::new(file!());
@@ -430,6 +598,27 @@ fn main() {
         args.limit.min(states.len())
     };
 
+    // Weight arrays live for the whole run; leak once so immutable per-search
+    // EvalConfig values can borrow them for 'static.
+    let load_weights =
+        |path: &Option<String>| -> Option<&'static [f32; eval_api::NUM_EVAL_FEATURES]> {
+            path.as_ref().map(|p| {
+                let text = std::fs::read_to_string(p)
+                    .unwrap_or_else(|e| panic!("failed to read eval weights {}: {}", p, e));
+                let weights = eval_api::parse_eval_weights(&text)
+                    .unwrap_or_else(|e| panic!("bad eval weights {}: {}", p, e));
+                &*Box::leak(Box::new(weights))
+            })
+        };
+    let a_eval_weights = load_weights(&args.a_eval_weights);
+    let b_eval_weights = load_weights(&args.b_eval_weights);
+    let weights_name = |path: &Option<String>| -> &'static str {
+        match path {
+            Some(p) => Box::leak(p.clone().into_boxed_str()),
+            None => "default",
+        }
+    };
+
     let a_tree_reuse = args.a_tree_reuse || args.a_ponder_iterations > 0;
     let b_tree_reuse = args.b_tree_reuse || args.b_ponder_iterations > 0;
     if a_tree_reuse && args.a_threads > 1 {
@@ -447,6 +636,9 @@ fn main() {
         terminal_pair_cache: args.a_terminal_pair_cache,
         tree_reuse: a_tree_reuse && args.a_threads <= 1,
         ponder_iterations: args.a_ponder_iterations,
+        eval_config: eval_api::config(a_eval_weights, args.a_eval_clamp),
+        eval_weights_name: weights_name(&args.a_eval_weights),
+        eval_clamp: args.a_eval_clamp,
     };
     let config_b = EngineConfig {
         iterations: args.b_iterations,
@@ -457,6 +649,9 @@ fn main() {
         terminal_pair_cache: args.b_terminal_pair_cache,
         tree_reuse: b_tree_reuse && args.b_threads <= 1,
         ponder_iterations: args.b_ponder_iterations,
+        eval_config: eval_api::config(b_eval_weights, args.b_eval_clamp),
+        eval_weights_name: weights_name(&args.b_eval_weights),
+        eval_clamp: args.b_eval_clamp,
     };
     println!("A: {}", config_a.describe());
     println!("B: {}", config_b.describe());
@@ -474,6 +669,10 @@ fn main() {
     let mut draws = 0usize;
     let mut a_reuse = ReuseCounter::default();
     let mut b_reuse = ReuseCounter::default();
+    let mut dump = args
+        .dump_trajectories
+        .as_deref()
+        .map(TrajectoryDump::create);
     let start_time = std::time::Instant::now();
 
     for (state_index, state) in states.iter().take(state_limit).enumerate() {
@@ -485,6 +684,7 @@ fn main() {
                 } else {
                     (&config_b, &config_a)
                 };
+                let mut trace = dump.as_ref().map(|_| Vec::new());
                 let result = play_game(
                     state,
                     s1_config,
@@ -492,7 +692,11 @@ fn main() {
                     args.max_turns,
                     args.verbose,
                     &mut rng,
+                    trace.as_mut(),
                 );
+                if let (Some(dump), Some(trace)) = (dump.as_mut(), trace.as_ref()) {
+                    dump.write_game(state_index, result.s1_score, result.capped, trace);
+                }
                 let a_score = if a_is_side_one {
                     result.s1_score
                 } else {
@@ -530,6 +734,10 @@ fn main() {
                 );
             }
         }
+    }
+
+    if let Some(dump) = dump {
+        dump.finish();
     }
 
     let games = a_scores.len();

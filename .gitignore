@@ -8,3 +8,5 @@ poke-engine-py/docs/build/
 CONTEXT.md
 SELFPLAY_PLAN.md
 WORKLOG.md
+EVAL_TUNING_PLAN.md
+tools/eval_tuning/data/

@@ -13,6 +13,8 @@ It is nowhere near as complete or robust as the [PokemonShowdown](https://github
 
 #### [CHANGELOG](CHANGELOG.md)
 
+#### [Eval tuning](tools/eval_tuning/README.md)
+
 ## Running Directly
 
 ### Building
