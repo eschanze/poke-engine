@@ -9,7 +9,7 @@
 //! inside whatever section called it), so read the report as an inclusive
 //! call-tree flattened into a table, not as disjoint buckets.
 
-pub const NUM_SECTIONS: usize = 23;
+pub const NUM_SECTIONS: usize = 30;
 
 pub mod sec {
     pub const CALIB: usize = 0;
@@ -35,6 +35,13 @@ pub mod sec {
     pub const COMBINE_DUPES: usize = 20;
     pub const AFTER_MOVE_FINISH: usize = 21;
     pub const STATUS_CONDS: usize = 22;
+    pub const MATCHUP_TOTAL: usize = 23;
+    pub const MATCHUP_KERNEL: usize = 24;
+    pub const MATCHUP_AGGREGATE: usize = 25;
+    pub const MATCHUP_PAIR_KEY: usize = 26;
+    pub const MATCHUP_CACHE_LOOKUP: usize = 27;
+    pub const MATCHUP_PAIR_COMPUTE: usize = 28;
+    pub const MATCHUP_DAMAGE: usize = 29;
 }
 
 pub static SECTION_NAMES: [&str; NUM_SECTIONS] = [
@@ -61,6 +68,13 @@ pub static SECTION_NAMES: [&str; NUM_SECTIONS] = [
     ">> combine_duplicate_instructions",
     ">> after_move_finish",
     ">>> existing_status_conditions",
+    "> eval matchup total",
+    ">> matchup kernel build",
+    ">> matchup feature aggregation",
+    ">>> pair cache key",
+    ">>> pair cache lookup/store",
+    ">>> uncached pair compute",
+    ">>>> matchup damage calculation",
 ];
 
 #[cfg(feature = "prof")]

@@ -228,62 +228,85 @@ fn terrain_modifier(
     }
 }
 
-fn volatile_status_modifier(choice: &Choice, attacking_side: &Side, defending_side: &Side) -> f32 {
+fn volatile_status_modifier(
+    choice: &Choice,
+    attacking_side: &Side,
+    defending_side: &Side,
+    attacker_is_active: bool,
+    defender_is_active: bool,
+) -> f32 {
     let mut modifier = 1.0;
     let atk = &attacking_side.volatile_statuses;
-    if atk.contains(&PokemonVolatileStatus::FLASHFIRE) && choice.move_type == PokemonType::FIRE {
+    if attacker_is_active
+        && atk.contains(&PokemonVolatileStatus::FLASHFIRE)
+        && choice.move_type == PokemonType::FIRE
+    {
         modifier *= 1.5;
     }
-    if atk.contains(&PokemonVolatileStatus::SLOWSTART) && choice.category == MoveCategory::Physical
+    if attacker_is_active
+        && atk.contains(&PokemonVolatileStatus::SLOWSTART)
+        && choice.category == MoveCategory::Physical
     {
         modifier *= 0.5;
     }
-    if atk.contains(&PokemonVolatileStatus::CHARGE) && choice.move_type == PokemonType::ELECTRIC {
+    if attacker_is_active
+        && atk.contains(&PokemonVolatileStatus::CHARGE)
+        && choice.move_type == PokemonType::ELECTRIC
+    {
         modifier *= 2.0;
     }
-    if (atk.contains(&PokemonVolatileStatus::PROTOSYNTHESISATK)
-        || atk.contains(&PokemonVolatileStatus::QUARKDRIVEATK))
+    if attacker_is_active
+        && (atk.contains(&PokemonVolatileStatus::PROTOSYNTHESISATK)
+            || atk.contains(&PokemonVolatileStatus::QUARKDRIVEATK))
         && choice.category == MoveCategory::Physical
     {
         modifier *= 1.3;
     }
-    if (atk.contains(&PokemonVolatileStatus::PROTOSYNTHESISSPA)
-        || atk.contains(&PokemonVolatileStatus::QUARKDRIVESPA))
+    if attacker_is_active
+        && (atk.contains(&PokemonVolatileStatus::PROTOSYNTHESISSPA)
+            || atk.contains(&PokemonVolatileStatus::QUARKDRIVESPA))
         && choice.category == MoveCategory::Special
     {
         modifier *= 1.3;
     }
 
     let def = &defending_side.volatile_statuses;
-    if def.contains(&PokemonVolatileStatus::MAGNETRISE)
+    if defender_is_active
+        && def.contains(&PokemonVolatileStatus::MAGNETRISE)
         && choice.move_type == PokemonType::GROUND
         && choice.move_id != Choices::THOUSANDARROWS
     {
         return 0.0;
     }
-    if def.contains(&PokemonVolatileStatus::TARSHOT) && choice.move_type == PokemonType::FIRE {
+    if defender_is_active
+        && def.contains(&PokemonVolatileStatus::TARSHOT)
+        && choice.move_type == PokemonType::FIRE
+    {
         modifier *= 2.0;
     }
-    if def.contains(&PokemonVolatileStatus::PHANTOMFORCE)
-        || def.contains(&PokemonVolatileStatus::SHADOWFORCE)
-        || def.contains(&PokemonVolatileStatus::BOUNCE)
-        || def.contains(&PokemonVolatileStatus::DIG)
-        || def.contains(&PokemonVolatileStatus::DIVE)
-        || def.contains(&PokemonVolatileStatus::FLY)
+    if defender_is_active
+        && (def.contains(&PokemonVolatileStatus::PHANTOMFORCE)
+            || def.contains(&PokemonVolatileStatus::SHADOWFORCE)
+            || def.contains(&PokemonVolatileStatus::BOUNCE)
+            || def.contains(&PokemonVolatileStatus::DIG)
+            || def.contains(&PokemonVolatileStatus::DIVE)
+            || def.contains(&PokemonVolatileStatus::FLY))
     {
         return 0.0;
     }
-    if def.contains(&PokemonVolatileStatus::GLAIVERUSH) {
+    if defender_is_active && def.contains(&PokemonVolatileStatus::GLAIVERUSH) {
         modifier *= 2.0;
     }
-    if (def.contains(&PokemonVolatileStatus::PROTOSYNTHESISDEF)
-        || def.contains(&PokemonVolatileStatus::QUARKDRIVEDEF))
+    if defender_is_active
+        && (def.contains(&PokemonVolatileStatus::PROTOSYNTHESISDEF)
+            || def.contains(&PokemonVolatileStatus::QUARKDRIVEDEF))
         && choice.category == MoveCategory::Physical
     {
         modifier /= 1.3;
     }
-    if (def.contains(&PokemonVolatileStatus::PROTOSYNTHESISSPD)
-        || def.contains(&PokemonVolatileStatus::QUARKDRIVESPD))
+    if defender_is_active
+        && (def.contains(&PokemonVolatileStatus::PROTOSYNTHESISSPD)
+            || def.contains(&PokemonVolatileStatus::QUARKDRIVESPD))
         && choice.category == MoveCategory::Special
     {
         modifier /= 1.3;
@@ -297,14 +320,16 @@ fn get_defending_types(
     defending_pkmn: &Pokemon,
     attacking_pkmn: &Pokemon,
     attacking_choice: &Choice,
+    defender_is_active: bool,
 ) -> (PokemonType, PokemonType) {
     if defending_pkmn.terastallized && !(defending_pkmn.tera_type == PokemonType::STELLAR) {
         return (defending_pkmn.tera_type, PokemonType::TYPELESS);
     }
     let mut defender_types = defending_pkmn.types;
-    if side
-        .volatile_statuses
-        .contains(&PokemonVolatileStatus::ROOST)
+    if defender_is_active
+        && side
+            .volatile_statuses
+            .contains(&PokemonVolatileStatus::ROOST)
     {
         if defender_types.0 == PokemonType::FLYING {
             defender_types = (PokemonType::TYPELESS, defender_types.1);
@@ -335,7 +360,38 @@ fn get_attacking_and_defending_stats(
     defending_side: &Side,
     state: &State,
     choice: &Choice,
+    attacker_is_active: bool,
+    defender_is_active: bool,
 ) -> (i16, i16, i16, i16) {
+    fn boosted_stat(
+        side: &Side,
+        pokemon: &Pokemon,
+        stat: PokemonBoostableStat,
+        active: bool,
+    ) -> i16 {
+        let raw = match stat {
+            PokemonBoostableStat::Attack => pokemon.attack,
+            PokemonBoostableStat::Defense => pokemon.defense,
+            PokemonBoostableStat::SpecialAttack => pokemon.special_attack,
+            PokemonBoostableStat::SpecialDefense => pokemon.special_defense,
+            PokemonBoostableStat::Speed => pokemon.speed,
+            _ => unreachable!(),
+        };
+        if !active {
+            return raw;
+        }
+        #[allow(unused_mut)]
+        let mut boost = side.get_boost_from_boost_enum(&stat);
+        #[cfg(feature = "gen4")]
+        if pokemon.ability == Abilities::SIMPLE {
+            boost = (boost * 2).min(6).max(-6);
+        }
+        if boost < 0 {
+            raw * 2 / (2 - boost as i16)
+        } else {
+            raw * (2 + boost as i16) / 2
+        }
+    }
     let mut should_calc_attacker_boost = true;
     let mut should_calc_defender_boost = true;
     let defending_stat;
@@ -349,14 +405,22 @@ fn get_attacking_and_defending_stats(
     match choice.category {
         MoveCategory::Physical => {
             if attacking_side.attack_boost > 0 {
-                crit_attacking_stat =
-                    attacking_side.calculate_boosted_stat(PokemonBoostableStat::Attack);
+                crit_attacking_stat = boosted_stat(
+                    attacking_side,
+                    attacker,
+                    PokemonBoostableStat::Attack,
+                    attacker_is_active,
+                );
             } else {
                 crit_attacking_stat = attacker.attack;
             }
             if defending_side.defense_boost <= 0 {
-                crit_defending_stat =
-                    defending_side.calculate_boosted_stat(PokemonBoostableStat::Defense);
+                crit_defending_stat = boosted_stat(
+                    defending_side,
+                    defender,
+                    PokemonBoostableStat::Defense,
+                    defender_is_active,
+                );
             } else {
                 crit_defending_stat = defender.defense;
             }
@@ -376,23 +440,35 @@ fn get_attacking_and_defending_stats(
             // checks for moves that change which stat is used for the attacking_stat
             if choice.move_id == Choices::FOULPLAY {
                 if should_calc_attacker_boost {
-                    attacking_final_stat =
-                        defending_side.calculate_boosted_stat(PokemonBoostableStat::Attack);
+                    attacking_final_stat = boosted_stat(
+                        defending_side,
+                        defender,
+                        PokemonBoostableStat::Attack,
+                        defender_is_active,
+                    );
                 } else {
                     attacking_final_stat = defender.attack;
                 }
-                crit_attacking_stat = defending_side.get_active_immutable().attack;
+                crit_attacking_stat = defender.attack;
             } else if choice.move_id == Choices::BODYPRESS {
                 if should_calc_attacker_boost {
-                    attacking_final_stat =
-                        attacking_side.calculate_boosted_stat(PokemonBoostableStat::Defense);
+                    attacking_final_stat = boosted_stat(
+                        attacking_side,
+                        attacker,
+                        PokemonBoostableStat::Defense,
+                        attacker_is_active,
+                    );
                 } else {
                     attacking_final_stat = attacker.defense;
                 }
-                crit_attacking_stat = attacking_side.get_active_immutable().defense;
+                crit_attacking_stat = attacker.defense;
             } else if should_calc_attacker_boost {
-                attacking_final_stat =
-                    attacking_side.calculate_boosted_stat(PokemonBoostableStat::Attack);
+                attacking_final_stat = boosted_stat(
+                    attacking_side,
+                    attacker,
+                    PokemonBoostableStat::Attack,
+                    attacker_is_active,
+                );
             } else {
                 attacking_final_stat = attacker.attack;
             }
@@ -400,22 +476,34 @@ fn get_attacking_and_defending_stats(
             // Get the defending stat
             defending_stat = PokemonBoostableStat::Defense;
             if should_calc_defender_boost {
-                defending_final_stat =
-                    defending_side.calculate_boosted_stat(PokemonBoostableStat::Defense);
+                defending_final_stat = boosted_stat(
+                    defending_side,
+                    defender,
+                    PokemonBoostableStat::Defense,
+                    defender_is_active,
+                );
             } else {
                 defending_final_stat = defender.defense;
             }
         }
         MoveCategory::Special => {
             if attacking_side.special_attack_boost > 0 {
-                crit_attacking_stat =
-                    attacking_side.calculate_boosted_stat(PokemonBoostableStat::SpecialAttack);
+                crit_attacking_stat = boosted_stat(
+                    attacking_side,
+                    attacker,
+                    PokemonBoostableStat::SpecialAttack,
+                    attacker_is_active,
+                );
             } else {
                 crit_attacking_stat = attacker.special_attack;
             }
             if defending_side.special_defense_boost <= 0 {
-                crit_defending_stat =
-                    defending_side.calculate_boosted_stat(PokemonBoostableStat::SpecialDefense);
+                crit_defending_stat = boosted_stat(
+                    defending_side,
+                    defender,
+                    PokemonBoostableStat::SpecialDefense,
+                    defender_is_active,
+                );
             } else {
                 crit_defending_stat = defender.special_defense;
             }
@@ -432,8 +520,12 @@ fn get_attacking_and_defending_stats(
 
             // Get the attacking stat
             if should_calc_attacker_boost {
-                attacking_final_stat =
-                    attacking_side.calculate_boosted_stat(PokemonBoostableStat::SpecialAttack);
+                attacking_final_stat = boosted_stat(
+                    attacking_side,
+                    attacker,
+                    PokemonBoostableStat::SpecialAttack,
+                    attacker_is_active,
+                );
             } else {
                 attacking_final_stat = attacker.special_attack;
             }
@@ -445,24 +537,36 @@ fn get_attacking_and_defending_stats(
                 || choice.move_id == Choices::PSYSTRIKE
             {
                 if defending_side.defense_boost <= 0 {
-                    crit_defending_stat =
-                        defending_side.calculate_boosted_stat(PokemonBoostableStat::Defense);
+                    crit_defending_stat = boosted_stat(
+                        defending_side,
+                        defender,
+                        PokemonBoostableStat::Defense,
+                        defender_is_active,
+                    );
                 } else {
                     crit_defending_stat = defender.defense;
                 }
 
                 defending_stat = PokemonBoostableStat::Defense;
                 if should_calc_defender_boost {
-                    defending_final_stat =
-                        defending_side.calculate_boosted_stat(PokemonBoostableStat::Defense);
+                    defending_final_stat = boosted_stat(
+                        defending_side,
+                        defender,
+                        PokemonBoostableStat::Defense,
+                        defender_is_active,
+                    );
                 } else {
                     defending_final_stat = defender.defense;
                 }
             } else {
                 defending_stat = PokemonBoostableStat::SpecialDefense;
                 if should_calc_defender_boost {
-                    defending_final_stat =
-                        defending_side.calculate_boosted_stat(PokemonBoostableStat::SpecialDefense);
+                    defending_final_stat = boosted_stat(
+                        defending_side,
+                        defender,
+                        PokemonBoostableStat::SpecialDefense,
+                        defender_is_active,
+                    );
                 } else {
                     defending_final_stat = defender.special_defense;
                 }
@@ -511,6 +615,8 @@ fn common_pkmn_damage_calc(
     weather: &Weather,
     terrain: &Terrain,
     choice: &Choice,
+    attacker_is_active: bool,
+    defender_is_active: bool,
 ) -> f32 {
     let mut damage: f32;
     damage = 2.0 * attacker.level as f32;
@@ -521,7 +627,13 @@ fn common_pkmn_damage_calc(
     damage = damage.floor() / 50.0;
     damage = damage.floor() + 2.0;
 
-    let defender_types = get_defending_types(&defending_side, defender, attacker, choice);
+    let defender_types = get_defending_types(
+        defending_side,
+        defender,
+        attacker,
+        choice,
+        defender_is_active,
+    );
 
     let mut damage_modifier = 1.0;
 
@@ -541,7 +653,13 @@ fn common_pkmn_damage_calc(
 
     damage_modifier *= stab_modifier(&choice.move_type, &attacker);
     damage_modifier *= burn_modifier(&choice.category, &attacker.status);
-    damage_modifier *= volatile_status_modifier(&choice, attacking_side, defending_side);
+    damage_modifier *= volatile_status_modifier(
+        choice,
+        attacking_side,
+        defending_side,
+        attacker_is_active,
+        defender_is_active,
+    );
     damage_modifier *= terrain_modifier(terrain, attacker, defender, &choice);
 
     damage * damage_modifier
@@ -558,14 +676,39 @@ pub fn calculate_damage(
     choice: &Choice,
     _damage_rolls: DamageRolls,
 ) -> Option<(i16, i16)> {
+    let (attacking, defending) = state.get_both_sides_immutable(attacking_side);
+    calculate_damage_for_matchup(
+        state,
+        attacking,
+        attacking.get_active_immutable(),
+        true,
+        defending,
+        defending.get_active_immutable(),
+        true,
+        choice,
+        _damage_rolls,
+    )
+}
+
+/// Pure damage calculation for an explicit matchup participant. Bench
+/// participants use their persistent set and side conditions but not the
+/// current active's boosts or active-only volatile statuses.
+pub(crate) fn calculate_damage_for_matchup(
+    state: &State,
+    attacking_side: &Side,
+    attacker: &Pokemon,
+    attacker_is_active: bool,
+    defending_side: &Side,
+    defender: &Pokemon,
+    defender_is_active: bool,
+    choice: &Choice,
+    damage_rolls: DamageRolls,
+) -> Option<(i16, i16)> {
     if choice.category == MoveCategory::Status || choice.category == MoveCategory::Switch {
         return None;
     } else if choice.base_power == 0.0 {
         return Some((0, 0));
     }
-    let (attacking_side, defending_side) = state.get_both_sides_immutable(attacking_side);
-    let attacker = attacking_side.get_active_immutable();
-    let defender = defending_side.get_active_immutable();
     let (attacking_stat, defending_stat, crit_attacking_stat, crit_defending_stat) =
         get_attacking_and_defending_stats(
             attacker,
@@ -574,6 +717,8 @@ pub fn calculate_damage(
             defending_side,
             state,
             &choice,
+            attacker_is_active,
+            defender_is_active,
         );
 
     let mut damage = common_pkmn_damage_calc(
@@ -586,6 +731,8 @@ pub fn calculate_damage(
         &state.weather.weather_type,
         &state.terrain.terrain_type,
         choice,
+        attacker_is_active,
+        defender_is_active,
     );
     if attacker.ability != Abilities::INFILTRATOR {
         if defending_side.side_conditions.aurora_veil > 0 {
@@ -611,10 +758,12 @@ pub fn calculate_damage(
         &state.weather.weather_type,
         &state.terrain.terrain_type,
         choice,
+        attacker_is_active,
+        defender_is_active,
     );
     crit_damage *= CRIT_MULTIPLIER;
 
-    match _damage_rolls {
+    match damage_rolls {
         DamageRolls::Average => {
             damage = damage.floor() * 0.925;
             crit_damage = crit_damage.floor() * 0.925;
@@ -650,6 +799,8 @@ pub fn calculate_futuresight_damage(
         &Weather::NONE,
         &Terrain::NONE,
         MOVES.get(&Choices::FUTURESIGHT).unwrap(),
+        true,
+        true,
     );
     if attacker.ability != Abilities::INFILTRATOR {
         if defending_side.side_conditions.light_screen > 0 {

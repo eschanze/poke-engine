@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Texel-style tuning of the hand-crafted eval weights (numpy only).
 
-Fits the ~30 eval weights by logistic regression on game outcomes:
+Fits the 40 eval weights by logistic regression on game outcomes:
 minimize BCE of sigmoid(dot(w, features) / K) against the final result of
 the game each position came from. K is fixed at 80 to match the MCTS
 rollout squash sigmoid(0.0125 * (eval - root_eval)) — do not fit it.
@@ -58,6 +58,16 @@ FEATURE_NAMES = [
     "TOXIC_SPIKES",
     "STICKY_WEB",
     "USED_TERA",
+    "EFFECTIVE_HEALTH",
+    "TWO_HIT_KO_PRESSURE",
+    "REVENGE_COVERAGE",
+    "WALLBREAK_PRESSURE",
+    "THREAT_BREADTH",
+    "ANSWER_SCARCITY",
+    "WINCON",
+    "UNCOUNTERED",
+    "ACTIVE_DUEL",
+    "PIVOT_PRESSURE",
 ]
 
 DEFAULT_WEIGHTS = np.array(
@@ -92,6 +102,16 @@ DEFAULT_WEIGHTS = np.array(
         -7.0,   # TOXIC_SPIKES
         -25.0,  # STICKY_WEB
         -75.0,  # USED_TERA
+        15.0,   # EFFECTIVE_HEALTH
+        12.0,   # TWO_HIT_KO_PRESSURE
+        22.0,   # REVENGE_COVERAGE
+        50.0,   # WALLBREAK_PRESSURE
+        35.0,   # THREAT_BREADTH
+        18.0,   # ANSWER_SCARCITY
+        70.0,   # WINCON
+        25.0,   # UNCOUNTERED
+        12.0,   # ACTIVE_DUEL
+        18.0,   # PIVOT_PRESSURE
     ],
     dtype=np.float64,
 )
