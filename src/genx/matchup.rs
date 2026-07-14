@@ -220,6 +220,17 @@ fn normalize_choice(
     attacker_active: bool,
 ) -> Choice {
     let mut c = compact_choice(source);
+    // mirrors terastallized_base_power_floor in generate_instructions
+    #[cfg(feature = "terastallization")]
+    if attacker.terastallized
+        && c.move_type == attacker.tera_type
+        && c.base_power < 60.0
+        && c.priority <= 0
+        && c.multi_hit() == crate::choices::MultiHitMove::None
+        && c.multi_accuracy() == crate::choices::MultiAccuracyMove::None
+    {
+        c.base_power = 60.0;
+    }
     let hp_ratio = attacker.hp as f32 / attacker.maxhp.max(1) as f32;
     match c.move_id {
         Choices::REVERSAL => {
@@ -256,7 +267,7 @@ fn normalize_choice(
                 200.0
             }
         }
-        Choices::STOREDPOWER => {
+        Choices::STOREDPOWER | Choices::POWERTRIP => {
             let boosts = if attacker_active {
                 attacking_side.attack_boost.max(0)
                     + attacking_side.defense_boost.max(0)
@@ -307,7 +318,9 @@ fn normalize_choice(
             };
         }
         Choices::ACROBATICS if attacker.item == Items::NONE => c.base_power *= 2.0,
-        Choices::KNOCKOFF if defender.item != Items::NONE => c.base_power *= 1.5,
+        Choices::KNOCKOFF if defender.item != Items::NONE && !defender.item_is_permanent() => {
+            c.base_power *= 1.5
+        }
         Choices::FACADE if attacker.status != PokemonStatus::NONE => c.base_power *= 2.0,
         Choices::HEX if defender.status != PokemonStatus::NONE => c.base_power *= 2.0,
         Choices::BRINE if defender.hp * 2 <= defender.maxhp => c.base_power *= 2.0,
@@ -376,10 +389,13 @@ fn normalize_choice(
         Abilities::HUGEPOWER | Abilities::PUREPOWER if c.category == MoveCategory::Physical => {
             c.base_power *= 2.0
         }
-        Abilities::GUTS
-            if c.category == MoveCategory::Physical && attacker.status != PokemonStatus::NONE =>
-        {
-            c.base_power *= 3.0
+        Abilities::GUTS if attacker.status != PokemonStatus::NONE => {
+            c.base_power *= 1.5;
+            // the damage calc halves burned physical damage unconditionally;
+            // Guts ignores burn, so cancel that halving here (mirrors abilities.rs)
+            if attacker.status == PokemonStatus::BURN && c.category == MoveCategory::Physical {
+                c.base_power *= 2.0;
+            }
         }
         Abilities::ADAPTABILITY
             if c.move_type == attacker.types.0 || c.move_type == attacker.types.1 =>
@@ -456,7 +472,7 @@ fn normalize_choice(
         _ => {}
     }
     if defender.item == Items::EVIOLITE
-        || (defender.item == Items::ASSAULTVEST && c.category == MoveCategory::Special)
+        || (defender.item == Items::ASSAULTVEST && c.targets_special_defense())
     {
         c.base_power /= 1.5;
     }
@@ -670,13 +686,52 @@ fn ordered_pair_uncached(
     best
 }
 
+/// Usable ~50%-of-max-HP recovery. Rest (sleep cost), Wish (delayed), and
+/// 25% moves are deliberately excluded; the weather trio is treated as a
+/// flat 50% because weather is transient.
+fn has_usable_recovery(pokemon: &Pokemon) -> bool {
+    pokemon.moves.into_iter().any(|mv| {
+        !mv.disabled
+            && mv.pp > 0
+            && matches!(
+                mv.id,
+                Choices::RECOVER
+                    | Choices::ROOST
+                    | Choices::SLACKOFF
+                    | Choices::SOFTBOILED
+                    | Choices::MILKDRINK
+                    | Choices::SHOREUP
+                    | Choices::STRENGTHSAP
+                    | Choices::MORNINGSUN
+                    | Choices::SYNTHESIS
+                    | Choices::MOONLIGHT
+            )
+    })
+}
+
+/// Exact hits-to-KO from current HP, with recovery stall: if the defender can
+/// heal at least as much as one hit removes and gets a turn before dying, the
+/// attacker can never make progress with damage alone.
 #[inline]
-fn with_hits(mut result: PairResult, defender_hp: i16) -> PairResult {
-    result.hits = if result.damage > 0 {
-        Some((defender_hp + result.damage - 1) / result.damage.max(1))
-    } else {
-        None
-    };
+fn derive_hits(damage: i16, defender_hp: i16, defender_maxhp: i16, defender_recovers: bool) -> Option<i16> {
+    if damage <= 0 {
+        return None;
+    }
+    let hits = (defender_hp + damage - 1) / damage;
+    if defender_recovers && hits >= 2 && (damage as i32) * 2 < defender_maxhp as i32 {
+        return None;
+    }
+    Some(hits)
+}
+
+#[inline]
+fn with_hits(mut result: PairResult, defender: &Pokemon) -> PairResult {
+    result.hits = derive_hits(
+        result.damage,
+        defender.hp,
+        defender.maxhp,
+        has_usable_recovery(defender),
+    );
     result
 }
 
@@ -710,7 +765,7 @@ fn ordered_pair_keyed(
         (entry.key == key).then_some(entry.value)
     };
     if let Some(value) = cached {
-        return with_hits(value, defender.hp);
+        return with_hits(value, defender);
     }
     let mut value = ordered_pair_uncached(
         state, a_side, attacker, a_active, d_side, defender, d_active,
@@ -720,7 +775,7 @@ fn ordered_pair_keyed(
         crate::prof_scope!(crate::prof::sec::MATCHUP_CACHE_LOOKUP);
         cache[slot] = CacheEntry { key, value };
     }
-    with_hits(value, defender.hp)
+    with_hits(value, defender)
 }
 
 #[cfg(test)]
@@ -888,7 +943,12 @@ fn entry_hp(side: &Side, pokemon: &Pokemon) -> i16 {
     hp
 }
 
-pub(crate) fn is_counter(
+/// Defensive answer after entry: the candidate survives entry hazards plus one
+/// free hit from the threat's best move, and the threat does not strictly win
+/// the resulting recovery-aware front duel. This is deliberately weaker than
+/// "strictly wins the damage race" — a wall or a speed-tie trade that stops
+/// the threat from making progress is an answer even if it can't win outright.
+pub(crate) fn answers_after_entry(
     state: &State,
     kernel: &MatchupKernel,
     threat_on_one: bool,
@@ -920,17 +980,9 @@ pub(crate) fn is_counter(
     } else {
         kernel.one(candidate, threat)
     };
-    attack.hits = if attack.damage > 0 {
-        Some((remaining_hp + attack.damage - 1) / attack.damage)
-    } else {
-        None
-    };
-    reply.hits = if reply.damage > 0 {
-        Some((a.hp + reply.damage - 1) / reply.damage)
-    } else {
-        None
-    };
-    duel(state, reply, attack) == DuelResult::Win
+    attack.hits = derive_hits(attack.damage, remaining_hp, b.maxhp, has_usable_recovery(b));
+    reply.hits = derive_hits(reply.damage, a.hp, a.maxhp, has_usable_recovery(a));
+    duel(state, attack, reply) != DuelResult::Win
 }
 
 #[cfg(test)]
@@ -1017,7 +1069,7 @@ mod tests {
                         d,
                         true,
                     ),
-                    d.hp,
+                    d,
                 );
                 assert_eq!(cached, uncached);
             }
@@ -1059,6 +1111,275 @@ mod tests {
         state.side_two.get_active().hp -= 1;
         let damaged_damage = MatchupKernel::new(&state).one(0, 0).damage;
         assert!(damaged_damage > full_hp_damage);
+    }
+
+    #[test]
+    fn recovery_stall_denies_hits_and_flips_the_duel() {
+        let mut state = tackle_state();
+        state.side_two.get_active().maxhp = 300;
+        state.side_two.get_active().hp = 300;
+        let without_recovery = MatchupKernel::new(&state).one(0, 0).hits;
+        assert!(without_recovery.is_some());
+        state
+            .side_two
+            .get_active()
+            .replace_move(PokemonMoveIndex::M1, Choices::RECOVER);
+        let kernel = MatchupKernel::new(&state);
+        assert_eq!(None, kernel.one(0, 0).hits);
+        // the wall still damages side one, so it now strictly wins the duel
+        assert_eq!(DuelResult::Loss, kernel.duel_one(&state, 0, 0));
+    }
+
+    #[test]
+    fn recovery_does_not_stall_when_one_hit_outdamages_the_heal() {
+        let mut state = tackle_state();
+        state
+            .side_two
+            .get_active()
+            .replace_move(PokemonMoveIndex::M1, Choices::RECOVER);
+        let damage = MatchupKernel::new(&state).one(0, 0).damage;
+        state.side_two.get_active().maxhp = damage * 2;
+        state.side_two.get_active().hp = damage * 2;
+        assert_eq!(Some(2), MatchupKernel::new(&state).one(0, 0).hits);
+    }
+
+    #[test]
+    fn recovery_mon_in_ohko_range_is_still_ohko() {
+        let mut state = tackle_state();
+        state
+            .side_two
+            .get_active()
+            .replace_move(PokemonMoveIndex::M1, Choices::RECOVER);
+        state.side_two.get_active().maxhp = 300;
+        let damage = {
+            state.side_two.get_active().hp = 300;
+            MatchupKernel::new(&state).one(0, 0).damage
+        };
+        state.side_two.get_active().hp = damage;
+        assert_eq!(Some(1), MatchupKernel::new(&state).one(0, 0).hits);
+    }
+
+    #[test]
+    fn exhausted_recovery_does_not_stall() {
+        let mut state = tackle_state();
+        state.side_two.get_active().maxhp = 300;
+        state.side_two.get_active().hp = 300;
+        state
+            .side_two
+            .get_active()
+            .replace_move(PokemonMoveIndex::M1, Choices::RECOVER);
+        state.side_two.get_active().moves.m1.pp = 0;
+        assert!(MatchupKernel::new(&state).one(0, 0).hits.is_some());
+    }
+
+    #[test]
+    fn mutual_recovery_walls_draw() {
+        let mut state = tackle_state();
+        for side in [&mut state.side_one, &mut state.side_two] {
+            let active = side.get_active();
+            active.maxhp = 300;
+            active.hp = 300;
+            active.replace_move(PokemonMoveIndex::M1, Choices::RECOVER);
+        }
+        let kernel = MatchupKernel::new(&state);
+        assert_eq!(None, kernel.one(0, 0).hits);
+        assert_eq!(None, kernel.two(0, 0).hits);
+        assert_eq!(DuelResult::Draw, kernel.duel_one(&state, 0, 0));
+    }
+
+    #[test]
+    fn losing_the_post_entry_race_is_not_an_answer_but_walling_is() {
+        let state = tackle_state();
+        // an equal-stat candidate that eats a free hit loses the damage race
+        let kernel = MatchupKernel::new(&state);
+        assert!(!answers_after_entry(&state, &kernel, true, 0, 0));
+
+        // an unbreakable recovery wall answers even though it can never win
+        let mut state = tackle_state();
+        state
+            .side_two
+            .get_active()
+            .replace_move(PokemonMoveIndex::M0, Choices::RECOVER);
+        state.side_two.get_active().maxhp = 300;
+        state.side_two.get_active().hp = 300;
+        let kernel = MatchupKernel::new(&state);
+        assert_eq!(None, kernel.one(0, 0).hits);
+        assert!(answers_after_entry(&state, &kernel, true, 0, 0));
+    }
+
+    // Differential test: the kernel duplicates the engine's choice-modification
+    // hooks (modify_choice + ability/item hooks), so every modifier the kernel
+    // claims to support must produce the exact damage the engine pipeline does
+    // for an active-vs-active pair.
+    #[test]
+    fn kernel_damage_matches_engine_modify_pipeline_for_active_pairs() {
+        use super::super::abilities::{
+            ability_modify_attack_against, ability_modify_attack_being_used,
+        };
+        use super::super::choice_effects::modify_choice;
+        use super::super::damage_calc::calculate_damage;
+        use super::super::items::{item_modify_attack_against, item_modify_attack_being_used};
+        use crate::state::{PokemonMoveIndex, SideReference};
+
+        let scenarios: &[(&str, Choices, fn(&mut State))] = &[
+            ("plain_tackle", Choices::TACKLE, |_| {}),
+            ("attack_boost", Choices::TACKLE, |s| {
+                s.side_one.attack_boost = 2;
+            }),
+            ("burned_physical", Choices::TACKLE, |s| {
+                s.side_one.get_active().status = PokemonStatus::BURN;
+            }),
+            ("guts_burned_physical", Choices::TACKLE, |s| {
+                s.side_one.get_active().ability = Abilities::GUTS;
+                s.side_one.get_active().status = PokemonStatus::BURN;
+            }),
+            ("guts_paralyzed_physical", Choices::TACKLE, |s| {
+                s.side_one.get_active().ability = Abilities::GUTS;
+                s.side_one.get_active().status = PokemonStatus::PARALYZE;
+            }),
+            ("guts_poisoned_special", Choices::SWIFT, |s| {
+                s.side_one.get_active().ability = Abilities::GUTS;
+                s.side_one.get_active().status = PokemonStatus::POISON;
+            }),
+            ("facade_burned", Choices::FACADE, |s| {
+                s.side_one.get_active().status = PokemonStatus::BURN;
+            }),
+            ("choice_band", Choices::TACKLE, |s| {
+                s.side_one.get_active().item = Items::CHOICEBAND;
+            }),
+            ("life_orb_special", Choices::SWIFT, |s| {
+                s.side_one.get_active().item = Items::LIFEORB;
+            }),
+            ("expert_belt_super_effective", Choices::MACHPUNCH, |s| {
+                s.side_one.get_active().item = Items::EXPERTBELT;
+            }),
+            ("technician_low_bp", Choices::AQUAJET, |s| {
+                s.side_one.get_active().ability = Abilities::TECHNICIAN;
+            }),
+            ("tough_claws_contact", Choices::TACKLE, |s| {
+                s.side_one.get_active().ability = Abilities::TOUGHCLAWS;
+            }),
+            ("adaptability_stab", Choices::TACKLE, |s| {
+                s.side_one.get_active().ability = Abilities::ADAPTABILITY;
+            }),
+            ("tinted_lens_resisted", Choices::TACKLE, |s| {
+                s.side_two.get_active().types = (PokemonType::ROCK, PokemonType::TYPELESS);
+                s.side_one.get_active().ability = Abilities::TINTEDLENS;
+            }),
+            ("thick_fat_fire", Choices::EMBER, |s| {
+                s.side_two.get_active().ability = Abilities::THICKFAT;
+            }),
+            ("fur_coat_physical", Choices::TACKLE, |s| {
+                s.side_two.get_active().ability = Abilities::FURCOAT;
+            }),
+            ("ice_scales_special", Choices::SWIFT, |s| {
+                s.side_two.get_active().ability = Abilities::ICESCALES;
+            }),
+            ("multiscale_full_hp", Choices::TACKLE, |s| {
+                s.side_two.get_active().ability = Abilities::MULTISCALE;
+            }),
+            ("multiscale_chipped", Choices::TACKLE, |s| {
+                s.side_two.get_active().ability = Abilities::MULTISCALE;
+                s.side_two.get_active().hp -= 1;
+            }),
+            ("filter_super_effective", Choices::MACHPUNCH, |s| {
+                s.side_two.get_active().ability = Abilities::FILTER;
+            }),
+            ("eviolite_defender", Choices::TACKLE, |s| {
+                s.side_two.get_active().item = Items::EVIOLITE;
+            }),
+            ("assault_vest_special", Choices::SWIFT, |s| {
+                s.side_two.get_active().item = Items::ASSAULTVEST;
+            }),
+            ("assault_vest_psyshock", Choices::PSYSHOCK, |s| {
+                s.side_two.get_active().item = Items::ASSAULTVEST;
+            }),
+            ("pixilate_hyper_voice", Choices::HYPERVOICE, |s| {
+                s.side_one.get_active().ability = Abilities::PIXILATE;
+            }),
+            ("knock_off_with_item", Choices::KNOCKOFF, |s| {
+                s.side_two.get_active().item = Items::LEFTOVERS;
+            }),
+            ("acrobatics_no_item", Choices::ACROBATICS, |_| {}),
+            ("hex_statused", Choices::HEX, |s| {
+                s.side_two.get_active().status = PokemonStatus::BURN;
+            }),
+            ("brine_below_half", Choices::BRINE, |s| {
+                s.side_two.get_active().hp = 40;
+            }),
+            ("weather_ball_rain", Choices::WEATHERBALL, |s| {
+                s.weather.weather_type = Weather::RAIN;
+                s.weather.turns_remaining = 5;
+            }),
+            ("low_kick_heavy", Choices::LOWKICK, |s| {
+                s.side_two.get_active().weight_kg = 210.0;
+            }),
+            ("heavy_slam", Choices::HEAVYSLAM, |s| {
+                s.side_one.get_active().weight_kg = 200.0;
+                s.side_two.get_active().weight_kg = 30.0;
+            }),
+            ("eruption_half_hp", Choices::ERUPTION, |s| {
+                s.side_one.get_active().hp = 50;
+            }),
+            ("reversal_low_hp", Choices::REVERSAL, |s| {
+                s.side_one.get_active().hp = 20;
+            }),
+            ("stored_power_boosted", Choices::STOREDPOWER, |s| {
+                s.side_one.special_attack_boost = 2;
+                s.side_one.defense_boost = 1;
+            }),
+            ("power_trip_boosted", Choices::POWERTRIP, |s| {
+                s.side_one.attack_boost = 2;
+            }),
+            ("last_respects_five_fainted", Choices::LASTRESPECTS, |_| {}),
+            ("supreme_overlord_five_fainted", Choices::TACKLE, |s| {
+                s.side_one.get_active().ability = Abilities::SUPREMEOVERLORD;
+            }),
+            ("reflect_physical", Choices::TACKLE, |s| {
+                s.side_two.side_conditions.reflect = 1;
+            }),
+            ("light_screen_special", Choices::SWIFT, |s| {
+                s.side_two.side_conditions.light_screen = 1;
+            }),
+            ("raging_bull_reflect", Choices::RAGINGBULL, |s| {
+                s.side_two.side_conditions.reflect = 1;
+            }),
+            ("blaze_low_hp_fire", Choices::EMBER, |s| {
+                s.side_one.get_active().ability = Abilities::BLAZE;
+                s.side_one.get_active().hp = 30;
+            }),
+            ("multi_hit_bullet_seed", Choices::BULLETSEED, |_| {}),
+            ("skill_link_bullet_seed", Choices::BULLETSEED, |s| {
+                s.side_one.get_active().ability = Abilities::SKILLLINK;
+            }),
+        ];
+
+        for (name, mv, setup) in scenarios {
+            let mut state = tackle_state();
+            state
+                .side_one
+                .get_active()
+                .replace_move(PokemonMoveIndex::M0, *mv);
+            setup(&mut state);
+
+            let kernel_damage = MatchupKernel::new(&state).one(0, 0).damage;
+
+            let mut choice = MOVES.get(mv).unwrap().clone();
+            choice.first_move = true;
+            let defender_choice = MOVES.get(&Choices::TACKLE).unwrap().clone();
+            let side_ref = SideReference::SideOne;
+            modify_choice(&state, &mut choice, &defender_choice, &side_ref);
+            ability_modify_attack_being_used(&state, &mut choice, &defender_choice, &side_ref);
+            ability_modify_attack_against(&state, &mut choice, &defender_choice, &side_ref);
+            item_modify_attack_being_used(&state, &mut choice, &side_ref);
+            item_modify_attack_against(&state, &mut choice, &side_ref);
+            let engine_damage = calculate_damage(&state, &side_ref, &choice, DamageRolls::Average)
+                .map(|d| d.0.max(0))
+                .unwrap_or(0)
+                * hit_multiplier(state.side_one.get_active_immutable(), &choice);
+
+            assert_eq!(engine_damage, kernel_damage, "scenario {name}");
+        }
     }
 
     #[test]

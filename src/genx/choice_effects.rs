@@ -234,6 +234,12 @@ pub fn modify_choice(
                 attacker_choice.base_power *= 2.0;
             }
         }
+        Choices::BRINE => {
+            let defender = defending_side.get_active_immutable();
+            if defender.hp * 2 <= defender.maxhp {
+                attacker_choice.base_power *= 2.0;
+            }
+        }
         Choices::HYDROSTEAM => {
             if state.weather_is_active(&Weather::SUN) {
                 attacker_choice.base_power *= 3.0; // 1.5x for being in sun, 2x for cancelling out rain debuff

@@ -5,8 +5,10 @@
 *.so
 **__pycache**
 poke-engine-py/docs/build/
+tools/eval_tuning/data/
 CONTEXT.md
 SELFPLAY_PLAN.md
 WORKLOG.md
 EVAL_TUNING_PLAN.md
-tools/eval_tuning/data/
+eval_features_spec.md
+eval_features_status_report.md

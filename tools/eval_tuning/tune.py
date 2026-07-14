@@ -65,7 +65,7 @@ FEATURE_NAMES = [
     "THREAT_BREADTH",
     "ANSWER_SCARCITY",
     "WINCON",
-    "UNCOUNTERED",
+    "UNANSWERED",
     "ACTIVE_DUEL",
     "PIVOT_PRESSURE",
 ]
@@ -109,7 +109,7 @@ DEFAULT_WEIGHTS = np.array(
         35.0,   # THREAT_BREADTH
         18.0,   # ANSWER_SCARCITY
         70.0,   # WINCON
-        25.0,   # UNCOUNTERED
+        25.0,   # UNANSWERED
         12.0,   # ACTIVE_DUEL
         18.0,   # PIVOT_PRESSURE
     ],

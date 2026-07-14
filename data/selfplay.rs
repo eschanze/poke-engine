@@ -19,8 +19,8 @@ use std::time::Duration;
 #[cfg(not(any(feature = "gen1", feature = "gen2", feature = "gen3")))]
 mod eval_api {
     pub use poke_engine::engine::evaluate::{
-        eval_feature_schema, eval_features, parse_eval_weights, EvalConfig, DEFAULT_EVAL_WEIGHTS,
-        NUM_EVAL_FEATURES,
+        eval_feature_schema, eval_features, parse_eval_weights, EvalConfig, DEFAULT_BENCH_SCALE,
+        DEFAULT_EVAL_WEIGHTS, NUM_EVAL_FEATURES,
     };
 
     pub const TUNING_SUPPORTED: bool = true;
@@ -28,8 +28,10 @@ mod eval_api {
     pub fn config(
         weights: Option<&'static [f32; NUM_EVAL_FEATURES]>,
         mon_clamp: bool,
+        bench_scale: f32,
     ) -> EvalConfig {
         EvalConfig::new(weights.unwrap_or(&DEFAULT_EVAL_WEIGHTS), mon_clamp)
+            .with_bench_scale(bench_scale)
     }
 }
 
@@ -39,6 +41,7 @@ mod eval_api {
 
     pub const NUM_EVAL_FEATURES: usize = 0;
     pub const TUNING_SUPPORTED: bool = false;
+    pub const DEFAULT_BENCH_SCALE: f32 = 0.5;
 
     pub fn parse_eval_weights(_text: &str) -> Result<[f32; NUM_EVAL_FEATURES], String> {
         Err("eval weight files are only supported for gen4+ builds".to_string())
@@ -52,6 +55,7 @@ mod eval_api {
     pub fn config(
         _weights: Option<&'static [f32; NUM_EVAL_FEATURES]>,
         _mon_clamp: bool,
+        _bench_scale: f32,
     ) -> EvalConfig {
         EvalConfig
     }
@@ -117,6 +121,9 @@ struct Args {
     /// fully linear tuning experiment
     #[clap(long, action = clap::ArgAction::Set, default_value_t = true, value_name = "BOOL")]
     a_eval_clamp: bool,
+    /// matchup-feature credit multiplier for A's benched mons (1.0 = no discount)
+    #[clap(long, default_value_t = eval_api::DEFAULT_BENCH_SCALE)]
+    a_bench_scale: f32,
 
     #[clap(long, default_value_t = 20000)]
     b_iterations: u32,
@@ -147,6 +154,9 @@ struct Args {
     /// fully linear tuning experiment
     #[clap(long, action = clap::ArgAction::Set, default_value_t = true, value_name = "BOOL")]
     b_eval_clamp: bool,
+    /// matchup-feature credit multiplier for B's benched mons (1.0 = no discount)
+    #[clap(long, default_value_t = eval_api::DEFAULT_BENCH_SCALE)]
+    b_bench_scale: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -163,12 +173,13 @@ struct EngineConfig {
     /// file the weights came from, for reporting only
     eval_weights_name: &'static str,
     eval_clamp: bool,
+    bench_scale: f32,
 }
 
 impl EngineConfig {
     fn describe(&self) -> String {
         format!(
-            "iterations={} time_ms={} threads={} c={} branch_all={} terminal_pair_cache={} tree_reuse={} ponder={} eval_weights={} eval_clamp={}",
+            "iterations={} time_ms={} threads={} c={} branch_all={} terminal_pair_cache={} tree_reuse={} ponder={} eval_weights={} eval_clamp={} bench_scale={}",
             self.iterations,
             self.time_ms,
             self.threads,
@@ -178,7 +189,8 @@ impl EngineConfig {
             self.tree_reuse,
             self.ponder_iterations,
             self.eval_weights_name,
-            self.eval_clamp
+            self.eval_clamp,
+            self.bench_scale
         )
     }
 }
@@ -636,9 +648,10 @@ fn main() {
         terminal_pair_cache: args.a_terminal_pair_cache,
         tree_reuse: a_tree_reuse && args.a_threads <= 1,
         ponder_iterations: args.a_ponder_iterations,
-        eval_config: eval_api::config(a_eval_weights, args.a_eval_clamp),
+        eval_config: eval_api::config(a_eval_weights, args.a_eval_clamp, args.a_bench_scale),
         eval_weights_name: weights_name(&args.a_eval_weights),
         eval_clamp: args.a_eval_clamp,
+        bench_scale: args.a_bench_scale,
     };
     let config_b = EngineConfig {
         iterations: args.b_iterations,
@@ -649,9 +662,10 @@ fn main() {
         terminal_pair_cache: args.b_terminal_pair_cache,
         tree_reuse: b_tree_reuse && args.b_threads <= 1,
         ponder_iterations: args.b_ponder_iterations,
-        eval_config: eval_api::config(b_eval_weights, args.b_eval_clamp),
+        eval_config: eval_api::config(b_eval_weights, args.b_eval_clamp, args.b_bench_scale),
         eval_weights_name: weights_name(&args.b_eval_weights),
         eval_clamp: args.b_eval_clamp,
+        bench_scale: args.b_bench_scale,
     };
     println!("A: {}", config_a.describe());
     println!("B: {}", config_b.describe());
