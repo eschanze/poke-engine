@@ -9,7 +9,7 @@ fn main() {
 #[cfg(not(any(feature = "gen1", feature = "gen2", feature = "gen3")))]
 mod genx_main {
     use clap::Parser;
-    use poke_engine::engine::evaluate::eval_pair_features;
+    use poke_engine::engine::evaluate::{eval_pair_features_with_bench_scale, DEFAULT_BENCH_SCALE};
     use poke_engine::state::State;
     use std::io::{BufRead, BufReader, BufWriter, Write};
 
@@ -21,6 +21,9 @@ mod genx_main {
         /// Output JSONL with side_one and side_two feature vectors.
         #[clap(long)]
         output: String,
+        /// Bench discount used during matchup feature extraction.
+        #[clap(long, default_value_t = DEFAULT_BENCH_SCALE)]
+        bench_scale: f32,
     }
 
     fn serialized_state(line: &str, line_no: usize) -> Result<&str, String> {
@@ -77,7 +80,7 @@ mod genx_main {
             let state_text =
                 serialized_state(&line, line_no).unwrap_or_else(|error| panic!("{}", error));
             let state = State::deserialize(state_text);
-            let pair = eval_pair_features(&state);
+            let pair = eval_pair_features_with_bench_scale(&state, args.bench_scale);
             output.write_all(b"{\"side_one\":").unwrap();
             write_vector(&mut output, &pair[0]).unwrap();
             output.write_all(b",\"side_two\":").unwrap();

@@ -1128,7 +1128,7 @@ pub fn eval_features(state: &State) -> [f32; NUM_EVAL_FEATURES] {
 /// (for example, both sides having high threat breadth) for nonlinear models.
 /// `eval_pair_features(state)[0] - eval_pair_features(state)[1]` is exactly
 /// `eval_features(state)` up to floating-point accumulation order.
-fn eval_pair_features_with_bench_scale(
+pub fn eval_pair_features_with_bench_scale(
     state: &State,
     bench_scale: f32,
 ) -> [[f32; NUM_EVAL_FEATURES]; 2] {
