@@ -6,6 +6,7 @@
 **__pycache**
 poke-engine-py/docs/build/
 tools/eval_tuning/data/
+/data/suite-shards/
 CONTEXT.md
 SELFPLAY_PLAN.md
 WORKLOG.md

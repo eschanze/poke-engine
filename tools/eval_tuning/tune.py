@@ -216,8 +216,15 @@ def bce_grad(w, x, y, k):
     return x.T @ (p - y) / (len(y) * k)
 
 
-def tune(x, y, w0, k, l2, lr, steps, x_val, y_val, log_every):
-    """Full-batch Adam on BCE + 0.5*l2*||w - w0||^2; returns best-val weights."""
+def tune(x, y, w0, k, l2, l1, lr, steps, x_val, y_val, log_every):
+    """Full-batch Adam on BCE + 0.5*l2*||w - w0||^2 + l1*||w||_1.
+
+    The L2 term pulls toward the current weights (a prior); the L1 term pulls
+    toward zero and is applied as a proximal soft-threshold after each Adam
+    step (threshold lr*l1 — approximate under Adam's per-coordinate scaling,
+    standard decoupled-prox practice), so useless features die to exactly 0.
+    Returns best-val weights.
+    """
     w = w0.copy()
     m = np.zeros_like(w)
     v = np.zeros_like(w)
@@ -232,6 +239,8 @@ def tune(x, y, w0, k, l2, lr, steps, x_val, y_val, log_every):
         m_hat = m / (1 - beta1**step)
         v_hat = v / (1 - beta2**step)
         w -= lr * m_hat / (np.sqrt(v_hat) + eps)
+        if l1 > 0:
+            w = np.sign(w) * np.maximum(np.abs(w) - lr * l1, 0.0)
         if step % log_every == 0 or step == steps:
             train = bce_loss(w, x, y, k)
             if have_val:
@@ -253,6 +262,7 @@ def main():
     ap.add_argument("--out", required=True, help="output weights file")
     ap.add_argument("--k", type=float, default=80.0, help="eval-to-probability scale; keep at 80 to match the search (see plan)")
     ap.add_argument("--l2", type=float, default=0.0, help="L2 pull toward the current weights (prior strength)")
+    ap.add_argument("--l1", type=float, default=0.0, help="L1 pull toward zero (feature elimination; proximal)")
     ap.add_argument("--lr", type=float, default=0.5, help="Adam learning rate, in eval units per step")
     ap.add_argument("--steps", type=int, default=4000, help="optimization steps (full batch)")
     ap.add_argument("--val-frac", type=float, default=0.2, help="fraction of starting states held out for validation")
@@ -266,6 +276,8 @@ def main():
         ap.error("--k must be finite and greater than zero")
     if not np.isfinite(args.l2) or args.l2 < 0:
         ap.error("--l2 must be finite and non-negative")
+    if not np.isfinite(args.l1) or args.l1 < 0:
+        ap.error("--l1 must be finite and non-negative")
     if not np.isfinite(args.lr) or args.lr <= 0:
         ap.error("--lr must be finite and greater than zero")
     if args.steps <= 0:
@@ -295,7 +307,7 @@ def main():
     print(f"  (coin flip: {np.log(2):.5f})\n")
 
     w = tune(
-        x_train, y_train, w0, args.k, args.l2, args.lr, args.steps,
+        x_train, y_train, w0, args.k, args.l2, args.l1, args.lr, args.steps,
         x_val, y_val, args.log_every,
     )
     if not np.all(np.isfinite(w)):
@@ -307,7 +319,7 @@ def main():
 
     with open(args.out, "w", encoding="utf-8") as f:
         f.write(f"# tuned by tools/eval_tuning/tune.py — K={args.k} l2={args.l2} "
-                f"steps={args.steps} lr={args.lr} seed={args.seed}\n")
+                f"l1={args.l1} steps={args.steps} lr={args.lr} seed={args.seed}\n")
         f.write(f"# data: {' '.join(args.data)}\n")
         for name, value in zip(FEATURE_NAMES, w):
             f.write(f"{name} {value:.4f}\n")

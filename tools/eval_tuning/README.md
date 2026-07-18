@@ -7,22 +7,29 @@ and an Elo gate before a candidate is adopted. Requires Python 3 + numpy only.
 ## Workflow
 
 ```powershell
-# 1. Collect: mirror selfplay with trajectory dump (from repo root)
-C:\Users\escha\.cargo\bin\cargo.exe run --release --no-default-features --features terastallization --bin selfplay -- -f gen9randombattle.txt --rounds 3 --dump-trajectories tools\eval_tuning\data\dump.jsonl
+# 1. Collect: sharded suite selfplay with trajectory dumps (from repo root)
+python tools\run_suite.py --time-ms 250 --dump-prefix data\suite-shards\traj
 
-# 2. Tune: logistic regression on outcomes (BCE at fixed K=80)
-python tools\eval_tuning\tune.py --data tools\eval_tuning\data\dump.jsonl --out tuned.txt
+# 2. Decorrelate: N evenly spaced positions per game; also remaps the
+# per-shard game_id/state_index to be globally unique before merging
+python tools\eval_tuning\subsample.py 12 sub12.jsonl data\suite-shards\traj-*.jsonl
 
-# 3. Gate: tuned linear eval vs the historical default at iteration parity
+# 3. Tune: logistic regression on outcomes (BCE at fixed K=80).
+# --l2 pulls toward the current weights (prior); --l1 pulls toward zero
+# and kills useless features exactly (veto-list friendly).
+python tools\eval_tuning\tune.py --data sub12.jsonl --l2 1e-4 --out tuned.txt
+
+# 4. Gate: tuned linear eval vs the historical default at iteration parity
 # (Elo decides, not BCE). Clamp options take an explicit true/false value.
 C:\Users\escha\.cargo\bin\cargo.exe run --release --no-default-features --features terastallization --bin selfplay -- -f gen9randombattle.txt --rounds 2 --a-eval-weights tuned.txt --a-eval-clamp false
 ```
 
 Diagnostics:
 
-- `sweep.py <dump.jsonl>` — L2-strength x split-seed cross-validation:
-  does any regularization level beat the current weights on held-out
-  starting states?
+- `sweep.py <dump.jsonl>` — regularization-strength x split-seed
+  cross-validation: does any level beat the current weights on held-out
+  starting states? `--mode l1` sweeps L1 instead (optionally on a fixed
+  `--l2`) and reports how many weights die to exactly zero.
 - `diag.py <dump.jsonl>` — baseline accuracy, calibration table, and a
   1-parameter global scale (temperature) fit.
 
