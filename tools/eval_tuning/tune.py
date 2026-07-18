@@ -58,12 +58,8 @@ FEATURE_NAMES = [
     "TOXIC_SPIKES",
     "STICKY_WEB",
     "USED_TERA",
-    "EFFECTIVE_HEALTH",
-    "TWO_HIT_KO_PRESSURE",
     "REVENGE_COVERAGE",
-    "WALLBREAK_PRESSURE",
     "THREAT_BREADTH",
-    "ANSWER_SCARCITY",
     "WINCON",
     "UNANSWERED",
     "ACTIVE_DUEL",
@@ -102,12 +98,8 @@ DEFAULT_WEIGHTS = np.array(
         -30.0,        # TOXIC_SPIKES
         0.0,          # STICKY_WEB
         -48.5478855,  # USED_TERA
-        0.0,          # EFFECTIVE_HEALTH
-        0.0,          # TWO_HIT_KO_PRESSURE
         3.1326059,    # REVENGE_COVERAGE
-        0.0,          # WALLBREAK_PRESSURE
         40.5900329,   # THREAT_BREADTH
-        0.0,          # ANSWER_SCARCITY
         14.4660979,   # WINCON
         20.1621173,   # UNANSWERED
         4.86702255,   # ACTIVE_DUEL

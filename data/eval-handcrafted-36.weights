@@ -1,4 +1,4 @@
-# Historical handcrafted 40-feature production evaluator (pre-2026-07-18).
+# Historical handcrafted 36-feature production evaluator (pre-2026-07-18; four zero-tuned matchup features removed 2026-07-18).
 POKEMON_ALIVE 30
 POKEMON_HP 100
 POKEMON_ITEM 10
@@ -29,12 +29,8 @@ SPIKES -7
 TOXIC_SPIKES -7
 STICKY_WEB -25
 USED_TERA -75
-EFFECTIVE_HEALTH 15
-TWO_HIT_KO_PRESSURE 12
 REVENGE_COVERAGE 22
-WALLBREAK_PRESSURE 50
 THREAT_BREADTH 35
-ANSWER_SCARCITY 18
 WINCON 70
 UNANSWERED 25
 ACTIVE_DUEL 12

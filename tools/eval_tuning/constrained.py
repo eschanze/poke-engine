@@ -13,7 +13,7 @@ from tune import FEATURE_NAMES, bce_grad, split_by_state_index
 
 def load_handcrafted_weights():
     """Load the fixed pre-tuning baseline used to reproduce this experiment."""
-    path = Path(__file__).resolve().parents[2] / "data" / "eval-handcrafted-40.weights"
+    path = Path(__file__).resolve().parents[2] / "data" / "eval-handcrafted-36.weights"
     values = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.split("#", 1)[0].strip()
@@ -57,12 +57,8 @@ BOUNDS = {
     "TOXIC_SPIKES": (-30, 0),
     "STICKY_WEB": (-40, 0),
     "USED_TERA": (-100, 0),
-    "EFFECTIVE_HEALTH": (0, 80),
-    "TWO_HIT_KO_PRESSURE": (0, 80),
     "REVENGE_COVERAGE": (0, 80),
-    "WALLBREAK_PRESSURE": (0, 120),
     "THREAT_BREADTH": (0, 100),
-    "ANSWER_SCARCITY": (0, 80),
     "WINCON": (0, 120),
     "UNANSWERED": (0, 100),
     "ACTIVE_DUEL": (0, 80),

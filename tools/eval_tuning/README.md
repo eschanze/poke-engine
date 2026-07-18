@@ -31,7 +31,7 @@ cargo run --release --no-default-features --features terastallization --bin eval
 python tools\eval_tuning\context_mlp.py --data sub12.jsonl --pair-data sub12-pair.jsonl --out context.model
 
 # Reproduce the adopted 500-game constrained fit. Bounds enforce sensible
-# signs/ranges; the fixed old baseline is data/eval-handcrafted-40.weights.
+# signs/ranges; the fixed old baseline is data/eval-handcrafted-36.weights.
 python tools\eval_tuning\constrained.py --data sub12.jsonl --pair-data sub12-pair.jsonl --out constrained.weights
 
 # 4. Gate: tuned linear eval vs the historical default at iteration parity
@@ -78,11 +78,11 @@ tested with grouped validation. The nonlinear models added little beyond a
 regularized linear refit while costing roughly 9–16% search throughput. They
 remain available as experimental `--eval-trees` / `--eval-mlp` models.
 
-The winner was a projected L1 logistic fit of the 40 existing features.
+The winner was a projected L1 logistic fit of the 40 existing features (schema since trimmed to 36).
 Semantic sign/range constraints removed pathological small-data coefficients
 and improved mean grouped five-fold BCE by **0.1155** versus the handcrafted
 evaluator. On 240 games from held-out starting positions at equal 250 ms, it
 scored **61.7%** (134/78/28), **+82.6 Elo** with a 95% interval of
 **[+38.5, +129.5]**. It is now `DEFAULT_EVAL_WEIGHTS`, with the per-mon clamp
-disabled. Reproduce the old evaluator with `data/eval-handcrafted-40.weights`
+disabled. Reproduce the old evaluator with `data/eval-handcrafted-36.weights`
 and `--eval-clamp true`.

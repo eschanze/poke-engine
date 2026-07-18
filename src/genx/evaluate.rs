@@ -14,7 +14,7 @@ use std::convert::TryInto;
 // production evaluator is exactly linear; the clamp remains available for
 // reproducing the historical evaluator and for experiments.
 
-pub const NUM_EVAL_FEATURES: usize = 40;
+pub const NUM_EVAL_FEATURES: usize = 36;
 
 // Feature indices. Grouped: per-mon clampable subtotal (HP..STATUS_ABILITY_BONUS
 // plus ITEM), active-only terms, side conditions, hazards, tera.
@@ -49,16 +49,12 @@ pub mod feat {
     pub const TOXIC_SPIKES: usize = 27;
     pub const STICKY_WEB: usize = 28;
     pub const USED_TERA: usize = 29;
-    pub const EFFECTIVE_HEALTH: usize = 30;
-    pub const TWO_HIT_KO_PRESSURE: usize = 31;
-    pub const REVENGE_COVERAGE: usize = 32;
-    pub const WALLBREAK_PRESSURE: usize = 33;
-    pub const THREAT_BREADTH: usize = 34;
-    pub const ANSWER_SCARCITY: usize = 35;
-    pub const WINCON: usize = 36;
-    pub const UNANSWERED: usize = 37;
-    pub const ACTIVE_DUEL: usize = 38;
-    pub const PIVOT_PRESSURE: usize = 39;
+    pub const REVENGE_COVERAGE: usize = 30;
+    pub const THREAT_BREADTH: usize = 31;
+    pub const WINCON: usize = 32;
+    pub const UNANSWERED: usize = 33;
+    pub const ACTIVE_DUEL: usize = 34;
+    pub const PIVOT_PRESSURE: usize = 35;
 }
 
 pub const EVAL_FEATURE_NAMES: [&str; NUM_EVAL_FEATURES] = [
@@ -92,12 +88,8 @@ pub const EVAL_FEATURE_NAMES: [&str; NUM_EVAL_FEATURES] = [
     "TOXIC_SPIKES",
     "STICKY_WEB",
     "USED_TERA",
-    "EFFECTIVE_HEALTH",
-    "TWO_HIT_KO_PRESSURE",
     "REVENGE_COVERAGE",
-    "WALLBREAK_PRESSURE",
     "THREAT_BREADTH",
-    "ANSWER_SCARCITY",
     "WINCON",
     "UNANSWERED",
     "ACTIVE_DUEL",
@@ -142,12 +134,8 @@ pub const DEFAULT_EVAL_WEIGHTS: [f32; NUM_EVAL_FEATURES] = [
     -30.0,        // TOXIC_SPIKES
     0.0,          // STICKY_WEB
     -48.5478855,  // USED_TERA
-    0.0,          // EFFECTIVE_HEALTH
-    0.0,          // TWO_HIT_KO_PRESSURE
     3.1326059,    // REVENGE_COVERAGE
-    0.0,          // WALLBREAK_PRESSURE
     40.5900329,   // THREAT_BREADTH
-    0.0,          // ANSWER_SCARCITY
     14.4660979,   // WINCON
     20.1621173,   // UNANSWERED
     4.86702255,   // ACTIVE_DUEL
@@ -1017,26 +1005,18 @@ fn walk_matchups<S: EvalSink>(state: &State, sink: &mut S, bench_scale: f32) {
     let _aggregate_profile = crate::prof::ProfScope::new(crate::prof::sec::MATCHUP_AGGREGATE);
     let active_one = state.side_one.active_index as usize;
     let active_two = state.side_two.active_index as usize;
-    let mut one = [0.0f32; 10];
-    let mut two = [0.0f32; 10];
+    let mut one = [0.0f32; 6];
+    let mut two = [0.0f32; 6];
 
     // Compute every living cross-team pair once, accumulating all matchup features
     // while its two directional results are hot in cache. Threat credit earned by
     // a benched mon is worth `bench_scale` of the active mon's credit, because a
     // bench threat still has to pay an entry before its matchups become real.
     // Revenge coverage is exempt: a revenge kill enters on a faint for free.
-    let mut min_hits_one = [3i16; 6];
-    let mut min_hits_two = [3i16; 6];
-    let mut active_hits_one = [3i16; 6];
-    let mut active_hits_two = [3i16; 6];
-    let mut pressured_one = [0.0f32; 6];
-    let mut pressured_two = [0.0f32; 6];
     let mut revenge_one = [false; 6];
     let mut revenge_two = [false; 6];
     let mut wins_one = [0usize; 6];
     let mut wins_two = [0usize; 6];
-    let mut answers_one = [0usize; 6];
-    let mut answers_two = [0usize; 6];
     let mut answered_one = [0usize; 6];
     let mut answered_two = [0usize; 6];
 
@@ -1044,51 +1024,28 @@ fn walk_matchups<S: EvalSink>(state: &State, sink: &mut S, bench_scale: f32) {
         if !k.alive_one[i] {
             continue;
         }
-        let one_scale = if i == active_one { 1.0 } else { bench_scale };
         for j in 0..6 {
             if !k.alive_two[j] {
                 continue;
             }
-            let two_scale = if j == active_two { 1.0 } else { bench_scale };
             let attack_one = k.one(i, j);
             let attack_two = k.two(j, i);
             let hp_one = state.side_one.pokemon[IDX[i]].hp;
             let hp_two = state.side_two.pokemon[IDX[j]].hp;
 
-            min_hits_one[i] = min_hits_one[i].min(attack_two.hits.unwrap_or(3).min(3));
-            min_hits_two[j] = min_hits_two[j].min(attack_one.hits.unwrap_or(3).min(3));
-            if j == active_two {
-                active_hits_one[i] = attack_two.hits.unwrap_or(3).min(3);
-            }
-            if i == active_one {
-                active_hits_two[j] = attack_one.hits.unwrap_or(3).min(3);
-            }
-            if attack_two.hits.map_or(false, |h| h <= 2) {
-                pressured_one[i] = pressured_one[i].max(two_scale);
-            }
-            if attack_one.hits.map_or(false, |h| h <= 2) {
-                pressured_two[j] = pressured_two[j].max(one_scale);
-            }
             revenge_one[i] |= attack_two.damage >= hp_one
                 && moves_before(state, attack_two, attack_one) == Some(true);
             revenge_two[j] |= attack_one.damage >= hp_two
                 && moves_before(state, attack_one, attack_two) == Some(true);
-            one[3] += one_scale * (attack_one.damage as f32 / hp_two.max(1) as f32).min(1.0) / 36.0;
-            two[3] += two_scale * (attack_two.damage as f32 / hp_one.max(1) as f32).min(1.0) / 36.0;
 
             match k.duel_one(state, i, j) {
                 DuelResult::Win => {
                     wins_one[i] += 1;
-                    answers_two[j] += 1;
                 }
                 DuelResult::Loss => {
-                    answers_one[i] += 1;
                     wins_two[j] += 1;
                 }
-                DuelResult::Draw => {
-                    answers_one[i] += 1;
-                    answers_two[j] += 1;
-                }
+                DuelResult::Draw => {}
             }
             answered_one[i] += answers_after_entry(state, &k, true, i, j) as usize;
             answered_two[j] += answers_after_entry(state, &k, false, j, i) as usize;
@@ -1098,34 +1055,20 @@ fn walk_matchups<S: EvalSink>(state: &State, sink: &mut S, bench_scale: f32) {
     for i in 0..6 {
         if k.alive_one[i] {
             let scale = if i == active_one { 1.0 } else { bench_scale };
-            // effective health blends "hits the opposing active needs" with
-            // "hits the best opposing attacker would need once it gets in"
-            one[0] += bench_scale * min_hits_one[i] as f32
-                + (1.0 - bench_scale) * active_hits_one[i] as f32;
-            two[1] += pressured_one[i];
-            two[2] += revenge_one[i] as u8 as f32;
+            two[0] += revenge_one[i] as u8 as f32;
             if k.count_two > 0 {
-                one[4] += scale * wins_one[i] as f32 / k.count_two as f32;
-                if answers_one[i] > 0 {
-                    one[5] += scale / answers_one[i] as f32;
-                }
-                one[6] += scale * (wins_one[i] == k.count_two) as u8 as f32;
-                one[7] += scale * (answered_one[i] == 0) as u8 as f32;
+                one[1] += scale * wins_one[i] as f32 / k.count_two as f32;
+                one[2] += scale * (wins_one[i] == k.count_two) as u8 as f32;
+                one[3] += scale * (answered_one[i] == 0) as u8 as f32;
             }
         }
         if k.alive_two[i] {
             let scale = if i == active_two { 1.0 } else { bench_scale };
-            two[0] += bench_scale * min_hits_two[i] as f32
-                + (1.0 - bench_scale) * active_hits_two[i] as f32;
-            one[1] += pressured_two[i];
-            one[2] += revenge_two[i] as u8 as f32;
+            one[0] += revenge_two[i] as u8 as f32;
             if k.count_one > 0 {
-                two[4] += scale * wins_two[i] as f32 / k.count_one as f32;
-                if answers_two[i] > 0 {
-                    two[5] += scale / answers_two[i] as f32;
-                }
-                two[6] += scale * (wins_two[i] == k.count_one) as u8 as f32;
-                two[7] += scale * (answered_two[i] == 0) as u8 as f32;
+                two[1] += scale * wins_two[i] as f32 / k.count_one as f32;
+                two[2] += scale * (wins_two[i] == k.count_one) as u8 as f32;
+                two[3] += scale * (answered_two[i] == 0) as u8 as f32;
             }
         }
     }
@@ -1133,15 +1076,15 @@ fn walk_matchups<S: EvalSink>(state: &State, sink: &mut S, bench_scale: f32) {
     if k.alive_one[active_one] && k.alive_two[active_two] {
         match k.duel_one(state, active_one, active_two) {
             DuelResult::Win => {
-                one[8] = 1.0;
+                one[4] = 1.0;
                 if answered_one[active_one] == 0 {
-                    one[9] = 1.0;
+                    one[5] = 1.0;
                 }
             }
             DuelResult::Loss => {
-                two[8] = 1.0;
+                two[4] = 1.0;
                 if answered_two[active_two] == 0 {
-                    two[9] = 1.0;
+                    two[5] = 1.0;
                 }
             }
             DuelResult::Draw => {}
@@ -1149,12 +1092,12 @@ fn walk_matchups<S: EvalSink>(state: &State, sink: &mut S, bench_scale: f32) {
     }
 
     sink.set_sign(1.0);
-    for i in 0..10 {
-        sink.global(feat::EFFECTIVE_HEALTH + i, one[i]);
+    for i in 0..6 {
+        sink.global(feat::REVENGE_COVERAGE + i, one[i]);
     }
     sink.set_sign(-1.0);
-    for i in 0..10 {
-        sink.global(feat::EFFECTIVE_HEALTH + i, two[i]);
+    for i in 0..6 {
+        sink.global(feat::REVENGE_COVERAGE + i, two[i]);
     }
 }
 
@@ -1223,7 +1166,7 @@ pub fn evaluate_with_config(state: &State, config: EvalConfig) -> f32 {
         total: 0.0,
     };
     eval_walk_base(state, &mut sink);
-    if config.weights[feat::EFFECTIVE_HEALTH..]
+    if config.weights[feat::REVENGE_COVERAGE..]
         .iter()
         .any(|weight| *weight != 0.0)
     {
@@ -1566,7 +1509,7 @@ mod tests {
         // The first 30 terms of the preserved handcrafted vector reproduce
         // the evaluator that predated feature decomposition.
         let mut historical =
-            parse_eval_weights(include_str!("../../data/eval-handcrafted-40.weights")).unwrap();
+            parse_eval_weights(include_str!("../../data/eval-handcrafted-36.weights")).unwrap();
         historical[30..].fill(0.0);
         for state in bundled_states().iter() {
             for variant in mutated_variants(state) {
@@ -1689,7 +1632,7 @@ mod tests {
             let mut swapped = state.clone();
             std::mem::swap(&mut swapped.side_one, &mut swapped.side_two);
             let mirrored = eval_features(&swapped);
-            for i in feat::EFFECTIVE_HEALTH..NUM_EVAL_FEATURES {
+            for i in feat::REVENGE_COVERAGE..NUM_EVAL_FEATURES {
                 assert!(
                     (original[i] + mirrored[i]).abs() < 1e-5,
                     "feature {} is not symmetric: {} vs {}",

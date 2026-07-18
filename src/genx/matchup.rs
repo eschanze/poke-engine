@@ -713,7 +713,12 @@ fn has_usable_recovery(pokemon: &Pokemon) -> bool {
 /// heal at least as much as one hit removes and gets a turn before dying, the
 /// attacker can never make progress with damage alone.
 #[inline]
-fn derive_hits(damage: i16, defender_hp: i16, defender_maxhp: i16, defender_recovers: bool) -> Option<i16> {
+fn derive_hits(
+    damage: i16,
+    defender_hp: i16,
+    defender_maxhp: i16,
+    defender_recovers: bool,
+) -> Option<i16> {
     if damage <= 0 {
         return None;
     }
