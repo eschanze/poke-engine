@@ -19,7 +19,8 @@ use std::time::Duration;
 #[cfg(not(any(feature = "gen1", feature = "gen2", feature = "gen3")))]
 mod eval_api {
     pub use poke_engine::engine::evaluate::{
-        eval_feature_schema, eval_features, parse_eval_weights, EvalConfig, DEFAULT_BENCH_SCALE,
+        eval_feature_schema, eval_features, parse_eval_context_model, parse_eval_tree_model,
+        parse_eval_weights, EvalConfig, EvalContextModel, EvalTreeModel, DEFAULT_BENCH_SCALE,
         DEFAULT_EVAL_WEIGHTS, NUM_EVAL_FEATURES,
     };
 
@@ -27,11 +28,19 @@ mod eval_api {
 
     pub fn config(
         weights: Option<&'static [f32; NUM_EVAL_FEATURES]>,
+        tree_model: Option<&'static EvalTreeModel>,
+        context_model: Option<&'static EvalContextModel>,
         mon_clamp: bool,
         bench_scale: f32,
     ) -> EvalConfig {
-        EvalConfig::new(weights.unwrap_or(&DEFAULT_EVAL_WEIGHTS), mon_clamp)
-            .with_bench_scale(bench_scale)
+        if let Some(model) = context_model {
+            EvalConfig::from_context_model(model).with_bench_scale(bench_scale)
+        } else if let Some(model) = tree_model {
+            EvalConfig::from_tree_model(model).with_bench_scale(bench_scale)
+        } else {
+            EvalConfig::new(weights.unwrap_or(&DEFAULT_EVAL_WEIGHTS), mon_clamp)
+                .with_bench_scale(bench_scale)
+        }
     }
 }
 
@@ -43,8 +52,17 @@ mod eval_api {
     pub const TUNING_SUPPORTED: bool = false;
     pub const DEFAULT_BENCH_SCALE: f32 = 0.5;
 
+    pub struct EvalTreeModel;
+    pub struct EvalContextModel;
+
     pub fn parse_eval_weights(_text: &str) -> Result<[f32; NUM_EVAL_FEATURES], String> {
         Err("eval weight files are only supported for gen4+ builds".to_string())
+    }
+    pub fn parse_eval_tree_model(_text: &str) -> Result<EvalTreeModel, String> {
+        Err("eval tree models are only supported for gen4+ builds".to_string())
+    }
+    pub fn parse_eval_context_model(_text: &str) -> Result<EvalContextModel, String> {
+        Err("eval context models are only supported for gen4+ builds".to_string())
     }
     pub fn eval_features(_state: &poke_engine::state::State) -> [f32; NUM_EVAL_FEATURES] {
         []
@@ -54,6 +72,8 @@ mod eval_api {
     }
     pub fn config(
         _weights: Option<&'static [f32; NUM_EVAL_FEATURES]>,
+        _tree_model: Option<&'static EvalTreeModel>,
+        _context_model: Option<&'static EvalContextModel>,
         _mon_clamp: bool,
         _bench_scale: f32,
     ) -> EvalConfig {
@@ -75,6 +95,10 @@ struct Args {
     /// number of states to use from the file. 0 means all
     #[clap(short = 'l', long, default_value_t = 0)]
     limit: usize,
+
+    /// number of starting states to skip before applying --limit
+    #[clap(long, default_value_t = 0)]
+    skip: usize,
 
     /// swapped pairs per state (each round = 2 games)
     #[clap(long, default_value_t = 1)]
@@ -117,9 +141,15 @@ struct Args {
     /// eval weights file for A (default: built-in constants; gen4+ only)
     #[clap(long)]
     a_eval_weights: Option<String>,
-    /// whether A clamps negative per-mon eval subtotals; pass false for a
-    /// fully linear tuning experiment
-    #[clap(long, action = clap::ArgAction::Set, default_value_t = true, value_name = "BOOL")]
+    /// boosted-tree eval model for A (mutually exclusive with --a-eval-weights)
+    #[clap(long)]
+    a_eval_trees: Option<String>,
+    /// contextual MLP eval model for A (exclusive with other eval model flags)
+    #[clap(long)]
+    a_eval_mlp: Option<String>,
+    /// whether A clamps negative per-mon eval subtotals; the tuned production
+    /// evaluator is fully linear, while true restores the historical behavior
+    #[clap(long, action = clap::ArgAction::Set, default_value_t = false, value_name = "BOOL")]
     a_eval_clamp: bool,
     /// matchup-feature credit multiplier for A's benched mons (1.0 = no discount)
     #[clap(long, default_value_t = eval_api::DEFAULT_BENCH_SCALE)]
@@ -150,9 +180,15 @@ struct Args {
     /// eval weights file for B (default: built-in constants; gen4+ only)
     #[clap(long)]
     b_eval_weights: Option<String>,
-    /// whether B clamps negative per-mon eval subtotals; pass false for a
-    /// fully linear tuning experiment
-    #[clap(long, action = clap::ArgAction::Set, default_value_t = true, value_name = "BOOL")]
+    /// boosted-tree eval model for B (mutually exclusive with --b-eval-weights)
+    #[clap(long)]
+    b_eval_trees: Option<String>,
+    /// contextual MLP eval model for B (exclusive with other eval model flags)
+    #[clap(long)]
+    b_eval_mlp: Option<String>,
+    /// whether B clamps negative per-mon eval subtotals; the tuned production
+    /// evaluator is fully linear, while true restores the historical behavior
+    #[clap(long, action = clap::ArgAction::Set, default_value_t = false, value_name = "BOOL")]
     b_eval_clamp: bool,
     /// matchup-feature credit multiplier for B's benched mons (1.0 = no discount)
     #[clap(long, default_value_t = eval_api::DEFAULT_BENCH_SCALE)]
@@ -588,6 +624,22 @@ fn main() {
         eprintln!("trajectory dumps are only supported for gen4+ builds");
         exit(1);
     }
+    if args.a_eval_weights.is_some() as u8
+        + args.a_eval_trees.is_some() as u8
+        + args.a_eval_mlp.is_some() as u8
+        > 1
+    {
+        eprintln!("A eval model flags are mutually exclusive");
+        exit(1);
+    }
+    if args.b_eval_weights.is_some() as u8
+        + args.b_eval_trees.is_some() as u8
+        + args.b_eval_mlp.is_some() as u8
+        > 1
+    {
+        eprintln!("B eval model flags are mutually exclusive");
+        exit(1);
+    }
 
     let file_path = {
         let this_file = std::path::Path::new(file!());
@@ -604,10 +656,12 @@ fn main() {
     for line in lines {
         states.push(State::deserialize(&line))
     }
+    let state_start = args.skip.min(states.len());
+    let available_states = states.len() - state_start;
     let state_limit = if args.limit == 0 {
-        states.len()
+        available_states
     } else {
-        args.limit.min(states.len())
+        args.limit.min(available_states)
     };
 
     // Weight arrays live for the whole run; leak once so immutable per-search
@@ -624,12 +678,36 @@ fn main() {
         };
     let a_eval_weights = load_weights(&args.a_eval_weights);
     let b_eval_weights = load_weights(&args.b_eval_weights);
-    let weights_name = |path: &Option<String>| -> &'static str {
-        match path {
-            Some(p) => Box::leak(p.clone().into_boxed_str()),
-            None => "default",
-        }
+    let load_tree_model = |path: &Option<String>| -> Option<&'static eval_api::EvalTreeModel> {
+        path.as_ref().map(|p| {
+            let text = std::fs::read_to_string(p)
+                .unwrap_or_else(|e| panic!("failed to read eval tree model {}: {}", p, e));
+            let model = eval_api::parse_eval_tree_model(&text)
+                .unwrap_or_else(|e| panic!("bad eval tree model {}: {}", p, e));
+            &*Box::leak(Box::new(model))
+        })
     };
+    let a_eval_trees = load_tree_model(&args.a_eval_trees);
+    let b_eval_trees = load_tree_model(&args.b_eval_trees);
+    let load_context_model =
+        |path: &Option<String>| -> Option<&'static eval_api::EvalContextModel> {
+            path.as_ref().map(|p| {
+                let text = std::fs::read_to_string(p)
+                    .unwrap_or_else(|e| panic!("failed to read eval MLP model {}: {}", p, e));
+                let model = eval_api::parse_eval_context_model(&text)
+                    .unwrap_or_else(|e| panic!("bad eval MLP model {}: {}", p, e));
+                &*Box::leak(Box::new(model))
+            })
+        };
+    let a_eval_mlp = load_context_model(&args.a_eval_mlp);
+    let b_eval_mlp = load_context_model(&args.b_eval_mlp);
+    let eval_name =
+        |weights: &Option<String>, trees: &Option<String>, mlp: &Option<String>| -> &'static str {
+            match mlp.as_ref().or(trees.as_ref()).or(weights.as_ref()) {
+                Some(p) => Box::leak(p.clone().into_boxed_str()),
+                None => "default",
+            }
+        };
 
     let a_tree_reuse = args.a_tree_reuse || args.a_ponder_iterations > 0;
     let b_tree_reuse = args.b_tree_reuse || args.b_ponder_iterations > 0;
@@ -648,9 +726,15 @@ fn main() {
         terminal_pair_cache: args.a_terminal_pair_cache,
         tree_reuse: a_tree_reuse && args.a_threads <= 1,
         ponder_iterations: args.a_ponder_iterations,
-        eval_config: eval_api::config(a_eval_weights, args.a_eval_clamp, args.a_bench_scale),
-        eval_weights_name: weights_name(&args.a_eval_weights),
-        eval_clamp: args.a_eval_clamp,
+        eval_config: eval_api::config(
+            a_eval_weights,
+            a_eval_trees,
+            a_eval_mlp,
+            args.a_eval_clamp,
+            args.a_bench_scale,
+        ),
+        eval_weights_name: eval_name(&args.a_eval_weights, &args.a_eval_trees, &args.a_eval_mlp),
+        eval_clamp: args.a_eval_trees.is_none() && args.a_eval_mlp.is_none() && args.a_eval_clamp,
         bench_scale: args.a_bench_scale,
     };
     let config_b = EngineConfig {
@@ -662,9 +746,15 @@ fn main() {
         terminal_pair_cache: args.b_terminal_pair_cache,
         tree_reuse: b_tree_reuse && args.b_threads <= 1,
         ponder_iterations: args.b_ponder_iterations,
-        eval_config: eval_api::config(b_eval_weights, args.b_eval_clamp, args.b_bench_scale),
-        eval_weights_name: weights_name(&args.b_eval_weights),
-        eval_clamp: args.b_eval_clamp,
+        eval_config: eval_api::config(
+            b_eval_weights,
+            b_eval_trees,
+            b_eval_mlp,
+            args.b_eval_clamp,
+            args.b_bench_scale,
+        ),
+        eval_weights_name: eval_name(&args.b_eval_weights, &args.b_eval_trees, &args.b_eval_mlp),
+        eval_clamp: args.b_eval_trees.is_none() && args.b_eval_mlp.is_none() && args.b_eval_clamp,
         bench_scale: args.b_bench_scale,
     };
     println!("A: {}", config_a.describe());
@@ -689,7 +779,13 @@ fn main() {
         .map(TrajectoryDump::create);
     let start_time = std::time::Instant::now();
 
-    for (state_index, state) in states.iter().take(state_limit).enumerate() {
+    for (offset, state) in states
+        .iter()
+        .skip(state_start)
+        .take(state_limit)
+        .enumerate()
+    {
+        let state_index = state_start + offset;
         for round in 0..args.rounds {
             // two games per round with colors swapped
             for a_is_side_one in [true, false] {

@@ -42,10 +42,18 @@ def main() -> None:
     parser.add_argument("--rounds", type=int, default=1)
     parser.add_argument("--max-turns", type=int, default=200)
     parser.add_argument("--limit", type=int, default=0, help="states per shard, 0 = all")
+    parser.add_argument("--skip", type=int, default=0,
+                        help="states to skip at the start of every shard")
     parser.add_argument("--a-eval-weights", default=None)
     parser.add_argument("--b-eval-weights", default=None)
+    parser.add_argument("--a-eval-trees", default=None)
+    parser.add_argument("--b-eval-trees", default=None)
+    parser.add_argument("--a-eval-mlp", default=None)
+    parser.add_argument("--b-eval-mlp", default=None)
     parser.add_argument("--a-bench-scale", type=float, default=None)
     parser.add_argument("--b-bench-scale", type=float, default=None)
+    parser.add_argument("--a-eval-clamp", choices=["true", "false"], default=None)
+    parser.add_argument("--b-eval-clamp", choices=["true", "false"], default=None)
     parser.add_argument("--dump-prefix", default=None,
                         help="dump per-shard trajectory JSONL as <prefix>-<shard>.jsonl")
     args = parser.parse_args()
@@ -67,6 +75,7 @@ def main() -> None:
             str(selfplay),
             "-f", str(shard.resolve()),
             "-l", str(args.limit),
+            "--skip", str(args.skip),
             "--rounds", str(args.rounds),
             "--max-turns", str(args.max_turns),
             "--a-iterations", "0", "--a-time-ms", str(args.time_ms),
@@ -78,10 +87,22 @@ def main() -> None:
             cmd += ["--a-eval-weights", str(Path(args.a_eval_weights).resolve())]
         if args.b_eval_weights:
             cmd += ["--b-eval-weights", str(Path(args.b_eval_weights).resolve())]
+        if args.a_eval_trees:
+            cmd += ["--a-eval-trees", str(Path(args.a_eval_trees).resolve())]
+        if args.b_eval_trees:
+            cmd += ["--b-eval-trees", str(Path(args.b_eval_trees).resolve())]
+        if args.a_eval_mlp:
+            cmd += ["--a-eval-mlp", str(Path(args.a_eval_mlp).resolve())]
+        if args.b_eval_mlp:
+            cmd += ["--b-eval-mlp", str(Path(args.b_eval_mlp).resolve())]
         if args.a_bench_scale is not None:
             cmd += ["--a-bench-scale", str(args.a_bench_scale)]
         if args.b_bench_scale is not None:
             cmd += ["--b-bench-scale", str(args.b_bench_scale)]
+        if args.a_eval_clamp is not None:
+            cmd += ["--a-eval-clamp", args.a_eval_clamp]
+        if args.b_eval_clamp is not None:
+            cmd += ["--b-eval-clamp", args.b_eval_clamp]
         if args.dump_prefix:
             cmd += ["--dump-trajectories", f"{args.dump_prefix}-{shard.stem}.jsonl"]
         log = open(shard.with_suffix(".log"), "w")

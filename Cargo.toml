@@ -23,6 +23,10 @@ path = "data/benchmark.rs"
 name = "selfplay"
 path = "data/selfplay.rs"
 
+[[bin]]
+name = "eval-pair-features"
+path = "data/eval_pair_features.rs"
+
 [profile.release]
 debug = 1
 

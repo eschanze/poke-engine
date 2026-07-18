@@ -4,14 +4,15 @@ use super::matchup::{answers_after_entry, moves_before, DuelResult, MatchupKerne
 use super::state::PokemonVolatileStatus;
 use crate::choices::MoveCategory;
 use crate::state::{Pokemon, PokemonStatus, Side, State};
+use std::convert::TryInto;
 
 // The eval is a dot product between a weight vector and a feature vector
 // computed from the state (side one minus side two), so the weights can be
 // texel-tuned on game outcomes (see EVAL_TUNING_PLAN.md). One optional
 // nonlinearity: when EvalConfig::mon_clamp is on, each mon's hp/status/item
-// subtotal is clamped at 0 before the alive bonus is added. The historical
-// clamp remains the production default; tuning experiments can disable it
-// per search when they need evaluate() to be exactly linear in the weights.
+// subtotal is clamped at 0 before the alive bonus is added. The tuned
+// production evaluator is exactly linear; the clamp remains available for
+// reproducing the historical evaluator and for experiments.
 
 pub const NUM_EVAL_FEATURES: usize = 40;
 
@@ -103,51 +104,54 @@ pub const EVAL_FEATURE_NAMES: [&str; NUM_EVAL_FEATURES] = [
     "PIVOT_PRESSURE",
 ];
 
-// The historical hand-picked constants, now the seed weights for tuning.
+// Outcome-tuned production weights, fit with semantic sign/range constraints
+// on 480 decisive games and gated +82.6 Elo [38.5, 129.5] over 240 held-out
+// games at equal 250 ms. The historical hand-picked vector remains in
+// data/eval-handcrafted-40.weights for regression gates.
 // BURNED's feature is a physical-move-count multiplier and the five boost
 // weights multiply the fixed 13-entry boost table below; everything else
 // multiplies a count or a 0/1 flag.
 pub const DEFAULT_EVAL_WEIGHTS: [f32; NUM_EVAL_FEATURES] = [
-    30.0,  // POKEMON_ALIVE
-    100.0, // POKEMON_HP
-    10.0,  // POKEMON_ITEM
-    -40.0, // POKEMON_FROZEN
-    -25.0, // POKEMON_ASLEEP
-    -25.0, // POKEMON_PARALYZED
-    -30.0, // POKEMON_TOXIC
-    -10.0, // POKEMON_POISONED
-    -25.0, // POKEMON_BURNED
-    15.0,  // POISON_HEAL
-    10.0,  // STATUS_ABILITY_BONUS
-    30.0,  // POKEMON_ATTACK_BOOST
-    15.0,  // POKEMON_DEFENSE_BOOST
-    30.0,  // POKEMON_SPECIAL_ATTACK_BOOST
-    15.0,  // POKEMON_SPECIAL_DEFENSE_BOOST
-    30.0,  // POKEMON_SPEED_BOOST
-    -30.0, // LEECH_SEED
-    40.0,  // SUBSTITUTE
-    -20.0, // CONFUSION
-    20.0,  // REFLECT
-    20.0,  // LIGHT_SCREEN
-    40.0,  // AURORA_VEIL
-    5.0,   // SAFE_GUARD
-    7.0,   // TAILWIND
-    30.0,  // HEALING_WISH
-    -10.0, // STEALTH_ROCK
-    -7.0,  // SPIKES
-    -7.0,  // TOXIC_SPIKES
-    -25.0, // STICKY_WEB
-    -75.0, // USED_TERA
-    15.0,  // EFFECTIVE_HEALTH
-    12.0,  // TWO_HIT_KO_PRESSURE
-    22.0,  // REVENGE_COVERAGE
-    50.0,  // WALLBREAK_PRESSURE
-    35.0,  // THREAT_BREADTH
-    18.0,  // ANSWER_SCARCITY
-    70.0,  // WINCON
-    25.0,  // UNANSWERED
-    12.0,  // ACTIVE_DUEL
-    18.0,  // PIVOT_PRESSURE
+    62.7669384,   // POKEMON_ALIVE
+    41.0806585,   // POKEMON_HP
+    0.0,          // POKEMON_ITEM
+    -90.2561015,  // POKEMON_FROZEN
+    -0.408866373, // POKEMON_ASLEEP
+    -25.6112665,  // POKEMON_PARALYZED
+    -75.4539139,  // POKEMON_TOXIC
+    -24.6924447,  // POKEMON_POISONED
+    0.0,          // POKEMON_BURNED
+    52.9131556,   // POISON_HEAL
+    0.0,          // STATUS_ABILITY_BONUS
+    1.34682091,   // POKEMON_ATTACK_BOOST
+    4.54921779,   // POKEMON_DEFENSE_BOOST
+    0.0,          // POKEMON_SPECIAL_ATTACK_BOOST
+    24.9293773,   // POKEMON_SPECIAL_DEFENSE_BOOST
+    23.6278393,   // POKEMON_SPEED_BOOST
+    -32.9769423,  // LEECH_SEED
+    104.108085,   // SUBSTITUTE
+    -10.196138,   // CONFUSION
+    0.0,          // REFLECT
+    0.0,          // LIGHT_SCREEN
+    0.0,          // AURORA_VEIL
+    0.0,          // SAFE_GUARD
+    0.0,          // TAILWIND
+    60.0,         // HEALING_WISH
+    -2.97986335,  // STEALTH_ROCK
+    -17.3453197,  // SPIKES
+    -30.0,        // TOXIC_SPIKES
+    0.0,          // STICKY_WEB
+    -48.5478855,  // USED_TERA
+    0.0,          // EFFECTIVE_HEALTH
+    0.0,          // TWO_HIT_KO_PRESSURE
+    3.1326059,    // REVENGE_COVERAGE
+    0.0,          // WALLBREAK_PRESSURE
+    40.5900329,   // THREAT_BREADTH
+    0.0,          // ANSWER_SCARCITY
+    14.4660979,   // WINCON
+    20.1621173,   // UNANSWERED
+    4.86702255,   // ACTIVE_DUEL
+    3.7430539,    // PIVOT_PRESSURE
 ];
 
 /// How much a matchup credited to a benched Pokemon is worth relative to the
@@ -156,11 +160,119 @@ pub const DEFAULT_EVAL_WEIGHTS: [f32; NUM_EVAL_FEATURES] = [
 /// are discounted; 1.0 reproduces the original undiscounted aggregation.
 pub const DEFAULT_BENCH_SCALE: f32 = 0.5;
 
+#[derive(Clone, Debug, PartialEq)]
+enum EvalTreeNode {
+    Split {
+        feature: u8,
+        threshold: f32,
+        yes: u16,
+        no: u16,
+    },
+    Leaf(f32),
+}
+
+/// A compact gradient-boosted correction on top of a linear evaluator.
+/// Tree outputs are logits; evaluating both side orientations and taking
+/// half their difference guarantees score(swap(state)) == -score(state).
+#[derive(Clone, Debug, PartialEq)]
+pub struct EvalTreeModel {
+    base_weights: [f32; NUM_EVAL_FEATURES],
+    k: f32,
+    correction_clip: f32,
+    trees: Vec<Vec<EvalTreeNode>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EvalContextModel {
+    base_weights: [f32; NUM_EVAL_FEATURES],
+    k: f32,
+    correction_clip: f32,
+    diff_scale: [f32; NUM_EVAL_FEATURES],
+    total_mean: [f32; NUM_EVAL_FEATURES],
+    total_scale: [f32; NUM_EVAL_FEATURES],
+    difference_weights: Vec<[f32; NUM_EVAL_FEATURES]>,
+    context_weights: Vec<[f32; NUM_EVAL_FEATURES]>,
+    context_bias: Vec<f32>,
+    output_weights: Vec<f32>,
+}
+
+impl EvalContextModel {
+    fn evaluate(&self, pair: &[[f32; NUM_EVAL_FEATURES]; 2]) -> f32 {
+        let mut difference = [0.0; NUM_EVAL_FEATURES];
+        let mut context = [0.0; NUM_EVAL_FEATURES];
+        let mut base = 0.0;
+        for i in 0..NUM_EVAL_FEATURES {
+            let diff = pair[0][i] - pair[1][i];
+            base += self.base_weights[i] * diff;
+            difference[i] = diff / self.diff_scale[i];
+            context[i] = (pair[0][i] + pair[1][i] - self.total_mean[i]) / self.total_scale[i];
+        }
+        let mut raw = 0.0;
+        for hidden in 0..self.output_weights.len() {
+            let mut diff_sum = 0.0;
+            let mut context_sum = self.context_bias[hidden];
+            for feature in 0..NUM_EVAL_FEATURES {
+                diff_sum += self.difference_weights[hidden][feature] * difference[feature];
+                context_sum += self.context_weights[hidden][feature] * context[feature];
+            }
+            let odd = diff_sum.tanh();
+            let gate = 1.0 / (1.0 + (-context_sum).exp());
+            raw += self.output_weights[hidden] * odd * gate;
+        }
+        let correction = self.correction_clip * (raw / self.correction_clip).tanh();
+        base + self.k * correction
+    }
+}
+
+impl EvalTreeModel {
+    fn tree_sum(&self, features: &[f32; NUM_EVAL_FEATURES], sign: f32) -> f32 {
+        let mut total = 0.0;
+        for tree in &self.trees {
+            let mut index = 0usize;
+            loop {
+                match tree[index] {
+                    EvalTreeNode::Leaf(value) => {
+                        total += value;
+                        break;
+                    }
+                    EvalTreeNode::Split {
+                        feature,
+                        threshold,
+                        yes,
+                        no,
+                    } => {
+                        index = if sign * features[feature as usize] < threshold {
+                            yes as usize
+                        } else {
+                            no as usize
+                        };
+                    }
+                }
+            }
+        }
+        total
+    }
+
+    fn evaluate(&self, features: &[f32; NUM_EVAL_FEATURES]) -> f32 {
+        let base: f32 = self
+            .base_weights
+            .iter()
+            .zip(features)
+            .map(|(weight, feature)| weight * feature)
+            .sum();
+        let correction = (0.5 * (self.tree_sum(features, 1.0) - self.tree_sum(features, -1.0)))
+            .clamp(-self.correction_clip, self.correction_clip);
+        base + self.k * correction
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EvalConfig {
     weights: &'static [f32; NUM_EVAL_FEATURES],
     mon_clamp: bool,
     bench_scale: f32,
+    tree_model: Option<&'static EvalTreeModel>,
+    context_model: Option<&'static EvalContextModel>,
 }
 
 impl EvalConfig {
@@ -169,6 +281,26 @@ impl EvalConfig {
             weights,
             mon_clamp,
             bench_scale: DEFAULT_BENCH_SCALE,
+            tree_model: None,
+            context_model: None,
+        }
+    }
+    pub const fn from_tree_model(model: &'static EvalTreeModel) -> EvalConfig {
+        EvalConfig {
+            weights: &model.base_weights,
+            mon_clamp: false,
+            bench_scale: DEFAULT_BENCH_SCALE,
+            tree_model: Some(model),
+            context_model: None,
+        }
+    }
+    pub const fn from_context_model(model: &'static EvalContextModel) -> EvalConfig {
+        EvalConfig {
+            weights: &model.base_weights,
+            mon_clamp: false,
+            bench_scale: DEFAULT_BENCH_SCALE,
+            tree_model: None,
+            context_model: Some(model),
         }
     }
     pub const fn with_bench_scale(mut self, bench_scale: f32) -> EvalConfig {
@@ -179,7 +311,7 @@ impl EvalConfig {
 
 impl Default for EvalConfig {
     fn default() -> Self {
-        EvalConfig::new(&DEFAULT_EVAL_WEIGHTS, true)
+        EvalConfig::new(&DEFAULT_EVAL_WEIGHTS, false)
     }
 }
 
@@ -240,6 +372,343 @@ pub fn parse_eval_weights(text: &str) -> Result<[f32; NUM_EVAL_FEATURES], String
         return Err(format!("missing weight {}", EVAL_FEATURE_NAMES[missing]));
     }
     Ok(weights)
+}
+
+fn parse_finite_f32(value: &str, context: &str) -> Result<f32, String> {
+    let parsed = value
+        .parse::<f32>()
+        .map_err(|e| format!("bad {} value {}: {}", context, value, e))?;
+    if !parsed.is_finite() {
+        return Err(format!("{} must be finite", context));
+    }
+    Ok(parsed)
+}
+
+/// Parse the compact text format exported by tools/eval_tuning/boosted.py.
+pub fn parse_eval_tree_model(text: &str) -> Result<EvalTreeModel, String> {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    let mut cursor = 0usize;
+    let mut next = || -> Result<&str, String> {
+        let line = lines
+            .get(cursor)
+            .copied()
+            .ok_or_else(|| "unexpected end of tree model".to_string())?;
+        cursor += 1;
+        Ok(line)
+    };
+
+    if next()? != "poke-engine-tree-eval-v1" {
+        return Err("unsupported tree model format".to_string());
+    }
+    let schema_line = next()?;
+    let schema = schema_line
+        .strip_prefix("feature_schema ")
+        .ok_or_else(|| "missing feature_schema".to_string())?;
+    let expected_schema = eval_feature_schema();
+    if schema != expected_schema {
+        return Err(format!(
+            "tree model feature schema {}, expected {}",
+            schema, expected_schema
+        ));
+    }
+    let k_line = next()?;
+    let k = parse_finite_f32(
+        k_line
+            .strip_prefix("k ")
+            .ok_or_else(|| "missing k".to_string())?,
+        "k",
+    )?;
+    if k <= 0.0 {
+        return Err("k must be positive".to_string());
+    }
+    let clip_line = next()?;
+    let correction_clip = parse_finite_f32(
+        clip_line
+            .strip_prefix("correction_clip ")
+            .ok_or_else(|| "missing correction_clip".to_string())?,
+        "correction_clip",
+    )?;
+    if correction_clip <= 0.0 {
+        return Err("correction_clip must be positive".to_string());
+    }
+
+    let mut base_weights = [0.0; NUM_EVAL_FEATURES];
+    let mut seen = [false; NUM_EVAL_FEATURES];
+    for _ in 0..NUM_EVAL_FEATURES {
+        let line = next()?;
+        let mut parts = line.split_whitespace();
+        if parts.next() != Some("base") {
+            return Err("expected base weight".to_string());
+        }
+        let name = parts
+            .next()
+            .ok_or_else(|| "missing base weight name".to_string())?;
+        let value = parts
+            .next()
+            .ok_or_else(|| "missing base weight value".to_string())?;
+        if parts.next().is_some() {
+            return Err("trailing base weight tokens".to_string());
+        }
+        let feature = EVAL_FEATURE_NAMES
+            .iter()
+            .position(|candidate| *candidate == name)
+            .ok_or_else(|| format!("unknown base weight {}", name))?;
+        if seen[feature] {
+            return Err(format!("duplicate base weight {}", name));
+        }
+        base_weights[feature] = parse_finite_f32(value, name)?;
+        seen[feature] = true;
+    }
+
+    let trees_line = next()?;
+    let tree_count = trees_line
+        .strip_prefix("trees ")
+        .ok_or_else(|| "missing trees count".to_string())?
+        .parse::<usize>()
+        .map_err(|e| format!("bad trees count: {}", e))?;
+    let mut trees = Vec::with_capacity(tree_count);
+    for tree_index in 0..tree_count {
+        let tree_line = next()?;
+        let node_count = tree_line
+            .strip_prefix("tree ")
+            .ok_or_else(|| format!("missing tree {} header", tree_index))?
+            .parse::<usize>()
+            .map_err(|e| format!("bad tree {} node count: {}", tree_index, e))?;
+        if node_count == 0 || node_count > u16::MAX as usize {
+            return Err(format!(
+                "tree {} has invalid node count {}",
+                tree_index, node_count
+            ));
+        }
+        let mut nodes = Vec::with_capacity(node_count);
+        for node_index in 0..node_count {
+            let line = next()?;
+            let mut parts = line.split_whitespace();
+            match parts.next() {
+                Some("leaf") => {
+                    let value = parts
+                        .next()
+                        .ok_or_else(|| "missing leaf value".to_string())?;
+                    if parts.next().is_some() {
+                        return Err("trailing leaf tokens".to_string());
+                    }
+                    nodes.push(EvalTreeNode::Leaf(parse_finite_f32(value, "leaf")?));
+                }
+                Some("split") => {
+                    let feature = parts
+                        .next()
+                        .ok_or_else(|| "missing split feature".to_string())?
+                        .parse::<usize>()
+                        .map_err(|e| format!("bad split feature: {}", e))?;
+                    let threshold = parse_finite_f32(
+                        parts
+                            .next()
+                            .ok_or_else(|| "missing split threshold".to_string())?,
+                        "split threshold",
+                    )?;
+                    let yes = parts
+                        .next()
+                        .ok_or_else(|| "missing yes child".to_string())?
+                        .parse::<usize>()
+                        .map_err(|e| format!("bad yes child: {}", e))?;
+                    let no = parts
+                        .next()
+                        .ok_or_else(|| "missing no child".to_string())?
+                        .parse::<usize>()
+                        .map_err(|e| format!("bad no child: {}", e))?;
+                    if parts.next().is_some() {
+                        return Err("trailing split tokens".to_string());
+                    }
+                    if feature >= NUM_EVAL_FEATURES {
+                        return Err(format!("split feature {} out of range", feature));
+                    }
+                    if yes <= node_index
+                        || no <= node_index
+                        || yes >= node_count
+                        || no >= node_count
+                    {
+                        return Err(format!(
+                            "tree {} node {} has invalid children",
+                            tree_index, node_index
+                        ));
+                    }
+                    nodes.push(EvalTreeNode::Split {
+                        feature: feature as u8,
+                        threshold,
+                        yes: yes as u16,
+                        no: no as u16,
+                    });
+                }
+                token => return Err(format!("unknown tree node token {:?}", token)),
+            }
+        }
+        trees.push(nodes);
+    }
+    drop(next);
+    if cursor != lines.len() {
+        return Err("trailing tree model content".to_string());
+    }
+    Ok(EvalTreeModel {
+        base_weights,
+        k,
+        correction_clip,
+        trees,
+    })
+}
+
+fn parse_model_vector(line: &str, label: &str, expected: usize) -> Result<Vec<f32>, String> {
+    let mut parts = line.split_whitespace();
+    if parts.next() != Some(label) {
+        return Err(format!("expected {}", label));
+    }
+    let values: Result<Vec<f32>, String> =
+        parts.map(|value| parse_finite_f32(value, label)).collect();
+    let values = values?;
+    if values.len() != expected {
+        return Err(format!(
+            "{} has {} values, expected {}",
+            label,
+            values.len(),
+            expected
+        ));
+    }
+    Ok(values)
+}
+
+/// Parse the context-gated MLP exported by tools/eval_tuning/context_mlp.py.
+pub fn parse_eval_context_model(text: &str) -> Result<EvalContextModel, String> {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    let mut cursor = 0usize;
+    let mut next = || -> Result<&str, String> {
+        let line = lines
+            .get(cursor)
+            .copied()
+            .ok_or_else(|| "unexpected end of context model".to_string())?;
+        cursor += 1;
+        Ok(line)
+    };
+    if next()? != "poke-engine-context-mlp-v1" {
+        return Err("unsupported context model format".to_string());
+    }
+    let schema_line = next()?;
+    let schema = schema_line
+        .strip_prefix("feature_schema ")
+        .ok_or_else(|| "missing feature_schema".to_string())?;
+    let expected_schema = eval_feature_schema();
+    if schema != expected_schema {
+        return Err(format!(
+            "context model feature schema {}, expected {}",
+            schema, expected_schema
+        ));
+    }
+    let k_line = next()?;
+    let k = parse_finite_f32(
+        k_line
+            .strip_prefix("k ")
+            .ok_or_else(|| "missing k".to_string())?,
+        "k",
+    )?;
+    let clip_line = next()?;
+    let correction_clip = parse_finite_f32(
+        clip_line
+            .strip_prefix("correction_clip ")
+            .ok_or_else(|| "missing correction_clip".to_string())?,
+        "correction_clip",
+    )?;
+    if k <= 0.0 || correction_clip <= 0.0 {
+        return Err("k and correction_clip must be positive".to_string());
+    }
+
+    let mut base_weights = [0.0; NUM_EVAL_FEATURES];
+    let mut seen = [false; NUM_EVAL_FEATURES];
+    for _ in 0..NUM_EVAL_FEATURES {
+        let line = next()?;
+        let mut parts = line.split_whitespace();
+        if parts.next() != Some("base") {
+            return Err("expected base weight".to_string());
+        }
+        let name = parts
+            .next()
+            .ok_or_else(|| "missing base weight name".to_string())?;
+        let value = parts
+            .next()
+            .ok_or_else(|| "missing base weight value".to_string())?;
+        if parts.next().is_some() {
+            return Err("trailing base weight tokens".to_string());
+        }
+        let feature = EVAL_FEATURE_NAMES
+            .iter()
+            .position(|candidate| *candidate == name)
+            .ok_or_else(|| format!("unknown base weight {}", name))?;
+        if seen[feature] {
+            return Err(format!("duplicate base weight {}", name));
+        }
+        base_weights[feature] = parse_finite_f32(value, name)?;
+        seen[feature] = true;
+    }
+
+    let diff_scale_vec = parse_model_vector(next()?, "diff_scale", NUM_EVAL_FEATURES)?;
+    let total_mean_vec = parse_model_vector(next()?, "total_mean", NUM_EVAL_FEATURES)?;
+    let total_scale_vec = parse_model_vector(next()?, "total_scale", NUM_EVAL_FEATURES)?;
+    let diff_scale: [f32; NUM_EVAL_FEATURES] = diff_scale_vec.try_into().unwrap();
+    let total_mean: [f32; NUM_EVAL_FEATURES] = total_mean_vec.try_into().unwrap();
+    let total_scale: [f32; NUM_EVAL_FEATURES] = total_scale_vec.try_into().unwrap();
+    if diff_scale
+        .iter()
+        .chain(total_scale.iter())
+        .any(|value| *value <= 0.0)
+    {
+        return Err("model scales must be positive".to_string());
+    }
+    let hidden_line = next()?;
+    let hidden = hidden_line
+        .strip_prefix("hidden ")
+        .ok_or_else(|| "missing hidden size".to_string())?
+        .parse::<usize>()
+        .map_err(|error| format!("bad hidden size: {}", error))?;
+    if hidden == 0 || hidden > 64 {
+        return Err(format!("hidden size {} is out of range", hidden));
+    }
+    let mut difference_weights = Vec::with_capacity(hidden);
+    for _ in 0..hidden {
+        difference_weights.push(
+            parse_model_vector(next()?, "difference", NUM_EVAL_FEATURES)?
+                .try_into()
+                .unwrap(),
+        );
+    }
+    let mut context_weights = Vec::with_capacity(hidden);
+    let mut context_bias = Vec::with_capacity(hidden);
+    for _ in 0..hidden {
+        let mut values = parse_model_vector(next()?, "context", NUM_EVAL_FEATURES + 1)?;
+        context_bias.push(values.pop().unwrap());
+        context_weights.push(values.try_into().unwrap());
+    }
+    let output_weights = parse_model_vector(next()?, "output", hidden)?;
+    drop(next);
+    if cursor != lines.len() {
+        return Err("trailing context model content".to_string());
+    }
+    Ok(EvalContextModel {
+        base_weights,
+        k,
+        correction_clip,
+        diff_scale,
+        total_mean,
+        total_scale,
+        difference_weights,
+        context_weights,
+        context_bias,
+        output_weights,
+    })
 }
 
 const POKEMON_BOOST_MULTIPLIER_6: f32 = 3.3;
@@ -381,6 +850,31 @@ impl EvalSink for ScoreSink<'_> {
 struct FeatureSink {
     sign: f32,
     features: [f32; NUM_EVAL_FEATURES],
+}
+
+struct PairFeatureSink {
+    side: usize,
+    features: [[f32; NUM_EVAL_FEATURES]; 2],
+}
+
+impl EvalSink for PairFeatureSink {
+    fn set_sign(&mut self, sign: f32) {
+        self.side = if sign > 0.0 { 0 } else { 1 };
+    }
+    fn hp(&mut self, hp: f32, maxhp: f32) {
+        self.features[self.side][feat::HP] += hp / maxhp;
+    }
+    fn mon(&mut self, idx: usize, value: f32) {
+        self.features[self.side][idx] += value;
+    }
+    fn finish_mon(&mut self) {
+        self.features[self.side][feat::ALIVE] += 1.0;
+    }
+    fn global(&mut self, idx: usize, value: f32) {
+        self.features[self.side][idx] += value;
+    }
+    fn start_global_group(&mut self) {}
+    fn finish_global_group(&mut self) {}
 }
 
 impl EvalSink for FeatureSink {
@@ -656,7 +1150,11 @@ fn walk_matchups<S: EvalSink>(state: &State, sink: &mut S, bench_scale: f32) {
 
     sink.set_sign(1.0);
     for i in 0..10 {
-        sink.global(feat::EFFECTIVE_HEALTH + i, one[i] - two[i]);
+        sink.global(feat::EFFECTIVE_HEALTH + i, one[i]);
+    }
+    sink.set_sign(-1.0);
+    for i in 0..10 {
+        sink.global(feat::EFFECTIVE_HEALTH + i, two[i]);
     }
 }
 
@@ -683,7 +1181,39 @@ pub fn eval_features(state: &State) -> [f32; NUM_EVAL_FEATURES] {
     sink.features
 }
 
+/// Per-side feature vectors before subtraction. These preserve shared context
+/// (for example, both sides having high threat breadth) for nonlinear models.
+/// `eval_pair_features(state)[0] - eval_pair_features(state)[1]` is exactly
+/// `eval_features(state)` up to floating-point accumulation order.
+fn eval_pair_features_with_bench_scale(
+    state: &State,
+    bench_scale: f32,
+) -> [[f32; NUM_EVAL_FEATURES]; 2] {
+    let mut sink = PairFeatureSink {
+        side: 0,
+        features: [[0.0; NUM_EVAL_FEATURES]; 2],
+    };
+    eval_walk(state, &mut sink, bench_scale);
+    sink.features
+}
+
+pub fn eval_pair_features(state: &State) -> [[f32; NUM_EVAL_FEATURES]; 2] {
+    eval_pair_features_with_bench_scale(state, DEFAULT_BENCH_SCALE)
+}
+
 pub fn evaluate_with_config(state: &State, config: EvalConfig) -> f32 {
+    if let Some(model) = config.context_model {
+        let pair = eval_pair_features_with_bench_scale(state, config.bench_scale);
+        return model.evaluate(&pair);
+    }
+    if let Some(model) = config.tree_model {
+        let mut sink = FeatureSink {
+            sign: 1.0,
+            features: [0.0; NUM_EVAL_FEATURES],
+        };
+        eval_walk(state, &mut sink, config.bench_scale);
+        return model.evaluate(&sink.features);
+    }
     let mut sink = ScoreSink {
         weights: config.weights,
         clamp: config.mon_clamp,
@@ -949,7 +1479,7 @@ mod tests {
     }
 
     fn bundled_states() -> Vec<State> {
-        include_str!("../../data/gen9randombattle.txt")
+        include_str!("../../data/gen9-battle-factory-no-ubers-states.txt")
             .lines()
             .filter(|line| !line.is_empty())
             .map(State::deserialize)
@@ -1033,8 +1563,10 @@ mod tests {
 
     #[test]
     fn weighted_walk_matches_reference_eval() {
-        // The first 30 terms still reproduce the historical evaluator.
-        let mut historical = DEFAULT_EVAL_WEIGHTS;
+        // The first 30 terms of the preserved handcrafted vector reproduce
+        // the evaluator that predated feature decomposition.
+        let mut historical =
+            parse_eval_weights(include_str!("../../data/eval-handcrafted-40.weights")).unwrap();
         historical[30..].fill(0.0);
         for state in bundled_states().iter() {
             for variant in mutated_variants(state) {
@@ -1066,6 +1598,24 @@ mod tests {
                     expected,
                     actual,
                     variant.serialize()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pair_features_reconstruct_difference_features() {
+        for state in bundled_states() {
+            let difference = eval_features(&state);
+            let pair = eval_pair_features(&state);
+            for i in 0..NUM_EVAL_FEATURES {
+                let reconstructed = pair[0][i] - pair[1][i];
+                assert!(
+                    (difference[i] - reconstructed).abs() < 1e-5,
+                    "feature {} differs: {} vs {}",
+                    EVAL_FEATURE_NAMES[i],
+                    difference[i],
+                    reconstructed
                 );
             }
         }
@@ -1105,12 +1655,31 @@ mod tests {
         assert!(parse_eval_weights(&format!("{}\nNOT_A_WEIGHT 1.0\n", text)).is_err());
         assert!(parse_eval_weights(&format!("{}POKEMON_ALIVE 30.0\n", text)).is_err());
         // duplicate
-        assert!(
-            parse_eval_weights(&text.replace("POKEMON_ALIVE 30", "POKEMON_ALIVE NaN")).is_err()
+        let alive_line = format!("POKEMON_ALIVE {}", DEFAULT_EVAL_WEIGHTS[feat::ALIVE]);
+        assert!(parse_eval_weights(&text.replace(&alive_line, "POKEMON_ALIVE NaN")).is_err());
+        assert!(parse_eval_weights(&text.replace(&alive_line, "POKEMON_ALIVE inf")).is_err());
+    }
+
+    #[test]
+    fn parse_tree_model_and_preserve_side_symmetry() {
+        let mut text = format!(
+            "poke-engine-tree-eval-v1\nfeature_schema {}\nk 80\ncorrection_clip 1\n",
+            eval_feature_schema()
         );
-        assert!(
-            parse_eval_weights(&text.replace("POKEMON_ALIVE 30", "POKEMON_ALIVE inf")).is_err()
-        );
+        for (name, weight) in EVAL_FEATURE_NAMES.iter().zip(DEFAULT_EVAL_WEIGHTS.iter()) {
+            text.push_str(&format!("base {} {}\n", name, weight));
+        }
+        text.push_str("trees 1\ntree 3\nsplit 0 0 1 2\nleaf 0.25\nleaf -0.25\n");
+        let model = parse_eval_tree_model(&text).unwrap();
+        let mut features = [0.0; NUM_EVAL_FEATURES];
+        features[feat::ALIVE] = 1.0;
+        let one = model.evaluate(&features);
+        for feature in &mut features {
+            *feature = -*feature;
+        }
+        let two = model.evaluate(&features);
+        assert_eq!(one, -two);
+        assert!(parse_eval_tree_model(&text.replace(&eval_feature_schema(), "wrong")).is_err());
     }
 
     #[test]
@@ -1133,7 +1702,7 @@ mod tests {
     }
 
     #[test]
-    fn default_config_preserves_historical_clamp() {
+    fn default_config_uses_unclamped_tuned_weights() {
         let mut state = bundled_states().remove(0);
         let mon = &mut state.side_one.pokemon.pkmn[1];
         mon.hp = 1;
@@ -1141,6 +1710,6 @@ mod tests {
         mon.ability = Abilities::NONE;
         mon.item = Items::NONE;
 
-        assert_eq!(evaluate(&state), score_with_clamp(&state, true));
+        assert_eq!(evaluate(&state), score_with_clamp(&state, false));
     }
 }

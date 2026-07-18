@@ -12,7 +12,7 @@ use poke_engine::state::{SideReference, State};
 use std::time::Duration;
 
 fn first_bundled_state() -> State {
-    let contents = std::fs::read_to_string("data/gen9randombattle.txt")
+    let contents = std::fs::read_to_string("data/gen9-battle-factory-no-ubers-states.txt")
         .expect("bundled state file should exist");
     let line = contents
         .lines()
@@ -244,7 +244,7 @@ fn test_changing_eval_config_discards_reusable_tree_statistics() {
     );
     assert_eq!(tree.root_visits(), 1000);
 
-    let linear_config = EvalConfig::new(&DEFAULT_EVAL_WEIGHTS, false);
+    let linear_config = EvalConfig::new(&DEFAULT_EVAL_WEIGHTS, true);
     let result = perform_mcts_with_tree_and_eval(
         &mut tree,
         &mut state,
