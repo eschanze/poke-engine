@@ -8,7 +8,7 @@ use std::convert::TryInto;
 
 // The eval is a dot product between a weight vector and a feature vector
 // computed from the state (side one minus side two), so the weights can be
-// texel-tuned on game outcomes (see EVAL_TUNING_PLAN.md). One optional
+// texel-tuned on game outcomes (see tools/eval_tuning/README.md). One optional
 // nonlinearity: when EvalConfig::mon_clamp is on, each mon's hp/status/item
 // subtotal is clamped at 0 before the alive bonus is added. The tuned
 // production evaluator is exactly linear; the clamp remains available for
@@ -99,7 +99,7 @@ pub const EVAL_FEATURE_NAMES: [&str; NUM_EVAL_FEATURES] = [
 // Outcome-tuned production weights, fit with semantic sign/range constraints
 // on 480 decisive games and gated +82.6 Elo [38.5, 129.5] over 240 held-out
 // games at equal 250 ms. The historical hand-picked vector remains in
-// data/eval-handcrafted-40.weights for regression gates.
+// data/eval-handcrafted-36.weights for regression gates.
 // BURNED's feature is a physical-move-count multiplier and the five boost
 // weights multiply the fixed 13-entry boost table below; everything else
 // multiplies a count or a 0/1 flag.

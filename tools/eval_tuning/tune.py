@@ -15,7 +15,7 @@ Output: a weights file loadable by selfplay --a-eval-weights / --b-eval-weights.
 Usage:
     python tune.py --data traj.jsonl --out tuned_weights.txt
 
-See EVAL_TUNING_PLAN.md at the repo root for the method and caveats.
+See tools/eval_tuning/README.md for the method and caveats.
 """
 
 import argparse

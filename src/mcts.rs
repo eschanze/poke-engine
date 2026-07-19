@@ -8,7 +8,7 @@ use rand::rngs::SmallRng;
 use std::time::Duration;
 
 // UCB1 exploration constant c in `avg + c * sqrt(ln(N) / n)`.
-// Tuned by self-play (2026-07-03, see WORKLOG.md): 0.5 beats the classical
+// Tuned by self-play on 2026-07-03: 0.5 beats the classical
 // sqrt(2) by ~+87 Elo at 20k iterations and ~+108 Elo at 100ms/12-thread
 // searches; 0.3 and 0.75 measured slightly worse than 0.5.
 pub const DEFAULT_EXPLORATION_CONSTANT: f32 = 0.5;

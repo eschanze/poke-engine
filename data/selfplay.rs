@@ -81,7 +81,7 @@ mod eval_api {
     }
 }
 
-// Self-play A/B harness. See SELFPLAY_PLAN.md for design rationale.
+// Self-play A/B harness. See the CLI help and tools/eval_tuning/README.md.
 //
 // Plays paired games (colors swapped) from each input state. Each side picks
 // its move with its own MCTS configuration; chance outcomes are sampled from
@@ -112,7 +112,7 @@ struct Args {
     verbose: bool,
 
     /// dump every visited position as JSONL (state, eval features, outcome)
-    /// for eval tuning — see EVAL_TUNING_PLAN.md and tools/eval_tuning
+    /// for eval tuning — see tools/eval_tuning/README.md
     #[clap(long)]
     dump_trajectories: Option<String>,
 
