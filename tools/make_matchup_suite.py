@@ -1,6 +1,6 @@
 """Build a large, duplicate-free matchup suite from an existing states file.
 
-The input file (e.g. data/gen9-battle-factory-no-ubers-states.txt) holds N
+The input file (e.g. data/datasets/battle-factory/no-ubers-states.txt) holds N
 serialized states = 2N teams. This script re-pairs those teams into new
 matchups using circular offsets: for each chosen offset r, team i plays team
 (i + r) mod 2N. Properties of this design:
@@ -26,12 +26,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--input",
-        default="data/gen9-battle-factory-no-ubers-states.txt",
+        default="data/datasets/battle-factory/no-ubers-states.txt",
         help="source states file (side1/side2/weather/terrain/trickroom/preview per line)",
     )
     parser.add_argument(
         "--output",
-        default="data/gen9-battle-factory-matchups-2000.txt",
+        default="data/datasets/battle-factory/matchups-2000.txt",
         help="combined output states file",
     )
     parser.add_argument(

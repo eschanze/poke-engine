@@ -7,7 +7,7 @@ Aggregates every shard summary into one combined W/L/D, winrate, and Elo diff.
 Example (overnight full suite, new-vs-old eval at 250 ms):
 
     python tools/run_suite.py --time-ms 250 \
-        --b-eval-weights data/eval-old-30.weights \
+        --b-eval-weights data/weights/eval-old-30.weights \
         --dump-prefix suite-trajectories
 
 Each shard writes its log to <shard>.log next to the shard file; pass

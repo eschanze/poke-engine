@@ -17,15 +17,19 @@ path = "src/main.rs"
 
 [[bin]]
 name = "benchmark"
-path = "data/benchmark.rs"
+path = "src/bin/benchmark.rs"
 
 [[bin]]
 name = "selfplay"
-path = "data/selfplay.rs"
+path = "src/bin/selfplay.rs"
 
 [[bin]]
 name = "eval-pair-features"
-path = "data/eval_pair_features.rs"
+path = "src/bin/eval_pair_features.rs"
+
+[[bin]]
+name = "relabel-root-value"
+path = "src/bin/relabel_root_value.rs"
 
 [profile.release]
 debug = 1

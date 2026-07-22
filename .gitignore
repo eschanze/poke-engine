@@ -6,5 +6,10 @@
 **__pycache**
 poke-engine-py/docs/build/
 tools/eval_tuning/data/
+# Regenerable / bulky datasets — kept local, rebuilt via tools/. Tracked data
+# is limited to the crate-baked battle-factory states, the seeded 2000-matchup
+# suite, and the weight snapshots. See data/README.md.
 /data/suite-shards/
+/data/datasets/gen9ou/
+/data/datasets/battle-factory/no-ubers-dex.json
 /docs/

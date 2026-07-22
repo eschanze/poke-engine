@@ -12,7 +12,7 @@ use poke_engine::state::{SideReference, State};
 use std::time::Duration;
 
 fn first_bundled_state() -> State {
-    let contents = std::fs::read_to_string("data/gen9-battle-factory-no-ubers-states.txt")
+    let contents = std::fs::read_to_string("data/datasets/battle-factory/no-ubers-states.txt")
         .expect("bundled state file should exist");
     let line = contents
         .lines()
