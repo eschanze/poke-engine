@@ -1,4 +1,4 @@
-# Historical handcrafted 36-feature production evaluator (pre-2026-07-18; four zero-tuned matchup features removed 2026-07-18).
+# Historical handcrafted 36-feature evaluator, zero-padded for the current schema.
 POKEMON_ALIVE 30
 POKEMON_HP 100
 POKEMON_ITEM 10
@@ -35,3 +35,5 @@ WINCON 70
 UNANSWERED 25
 ACTIVE_DUEL 12
 PIVOT_PRESSURE 18
+BENCH_HP 0
+WISH_RECOVERY 0

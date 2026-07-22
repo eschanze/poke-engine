@@ -933,7 +933,7 @@ impl MatchupKernel {
     }
 }
 
-fn entry_hp(side: &Side, pokemon: &Pokemon) -> i16 {
+pub(crate) fn entry_hp(side: &Side, pokemon: &Pokemon) -> i16 {
     if pokemon.item == Items::HEAVYDUTYBOOTS || pokemon.ability == Abilities::MAGICGUARD {
         return pokemon.hp;
     }

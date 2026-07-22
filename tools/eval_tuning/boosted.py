@@ -51,7 +51,7 @@ def load_base_weights(path):
     return result
 
 
-def load_positions(paths):
+def load_positions(paths, target="outcome"):
     features = []
     outcomes = []
     state_indices = []
@@ -81,12 +81,14 @@ def load_positions(paths):
     usable = [(key, rec) for key, rec in records if key not in truncated_games]
     if not usable:
         sys.exit("no usable non-truncated positions loaded")
+    if any(target not in rec for _, rec in usable):
+        sys.exit(f"--target {target} needs relabeled data (see relabel-root-value)")
     for key, rec in usable:
         feats = rec["features"]
         if len(feats) != len(FEATURE_NAMES):
             sys.exit(f"game {key}: got {len(feats)} features, expected {len(FEATURE_NAMES)}")
         features.append(feats)
-        outcomes.append(rec["outcome"])
+        outcomes.append(rec[target])
         state_indices.append(rec["state_index"])
         game_keys.append(key)
 
@@ -246,6 +248,8 @@ def main():
                     help="absolute tree correction limit in logit units at engine inference")
     ap.add_argument("--depths", type=int, nargs="+", default=[1, 2, 3])
     ap.add_argument("--min-child-weights", type=float, nargs="+", default=[2.0, 5.0, 10.0])
+    ap.add_argument("--target", choices=["outcome", "root_value"], default="outcome",
+                    help="training label: game outcome or relabeled teacher root value")
     args = ap.parse_args()
     if args.k <= 0 or not np.isfinite(args.k):
         ap.error("--k must be finite and positive")
@@ -258,7 +262,7 @@ def main():
     if args.fit_l1 is not None and args.base_weights:
         ap.error("--fit-l1 and --base-weights are mutually exclusive")
 
-    x, y, state_indices, game_ids = load_positions(args.data)
+    x, y, state_indices, game_ids = load_positions(args.data, args.target)
     weights = game_balanced_weights(game_ids)
     base_weights = load_base_weights(args.base_weights)
     fold_masks = [split_by_state_index(state_indices, 0.2, seed) for seed in range(5)]

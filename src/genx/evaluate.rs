@@ -1,6 +1,6 @@
 use super::abilities::Abilities;
 use super::items::Items;
-use super::matchup::{answers_after_entry, moves_before, DuelResult, MatchupKernel};
+use super::matchup::{answers_after_entry, entry_hp, moves_before, DuelResult, MatchupKernel};
 use super::state::PokemonVolatileStatus;
 use crate::choices::MoveCategory;
 use crate::state::{Pokemon, PokemonStatus, Side, State};
@@ -14,7 +14,31 @@ use std::convert::TryInto;
 // production evaluator is exactly linear; the clamp remains available for
 // reproducing the historical evaluator and for experiments.
 
-pub const NUM_EVAL_FEATURES: usize = 36;
+pub const NUM_EVAL_FEATURES: usize = 38;
+
+/// Experimental per-side features used by `eval-pair-features` for offline
+/// feature discovery. They are deliberately outside the production schema:
+/// candidates can be re-extracted from saved states and rejected without
+/// invalidating weight files or adding work to the search hot path.
+pub const NUM_EVAL_CANDIDATES: usize = 15;
+
+pub const EVAL_CANDIDATE_NAMES: [&str; NUM_EVAL_CANDIDATES] = [
+    "ENTRY_HP_LOSS",
+    "ENTRY_KO_COUNT",
+    "BEST_COVERAGE",
+    "SECOND_COVERAGE",
+    "WINCON_VITALITY",
+    "UNIQUE_ANSWER_FRAGILITY",
+    "SAFE_SWITCH_COUNT",
+    "TOXIC_PRESSURE",
+    "SUBSTITUTE_HP",
+    "WISH_RECOVERY",
+    "ACTIVE_HP",
+    "BENCH_HP",
+    "HP_SQUARED_SUM",
+    "LOW_HP_COUNT",
+    "HEALTHY_COUNT",
+];
 
 // Feature indices. Grouped: per-mon clampable subtotal (HP..STATUS_ABILITY_BONUS
 // plus ITEM), active-only terms, side conditions, hazards, tera.
@@ -55,6 +79,8 @@ pub mod feat {
     pub const UNANSWERED: usize = 33;
     pub const ACTIVE_DUEL: usize = 34;
     pub const PIVOT_PRESSURE: usize = 35;
+    pub const BENCH_HP: usize = 36;
+    pub const WISH_RECOVERY: usize = 37;
 }
 
 pub const EVAL_FEATURE_NAMES: [&str; NUM_EVAL_FEATURES] = [
@@ -94,12 +120,14 @@ pub const EVAL_FEATURE_NAMES: [&str; NUM_EVAL_FEATURES] = [
     "UNANSWERED",
     "ACTIVE_DUEL",
     "PIVOT_PRESSURE",
+    "BENCH_HP",
+    "WISH_RECOVERY",
 ];
 
 // Outcome-tuned production weights, fit with semantic sign/range constraints
 // on 480 decisive games and gated +82.6 Elo [38.5, 129.5] over 240 held-out
 // games at equal 250 ms. The historical hand-picked vector remains in
-// data/eval-handcrafted-36.weights for regression gates.
+// data/weights/eval-handcrafted-36.weights for regression gates.
 // BURNED's feature is a physical-move-count multiplier and the five boost
 // weights multiply the fixed 13-entry boost table below; everything else
 // multiplies a count or a 0/1 flag.
@@ -140,6 +168,8 @@ pub const DEFAULT_EVAL_WEIGHTS: [f32; NUM_EVAL_FEATURES] = [
     20.1621173,   // UNANSWERED
     4.86702255,   // ACTIVE_DUEL
     3.7430539,    // PIVOT_PRESSURE
+    0.0,          // BENCH_HP (experimental candidate: 2.0)
+    0.0,          // WISH_RECOVERY (experimental candidate: 47.0)
 ];
 
 /// How much a matchup credited to a benched Pokemon is worth relative to the
@@ -785,6 +815,9 @@ trait EvalSink {
     /// adding that subtotal to the side's score
     fn start_global_group(&mut self);
     fn finish_global_group(&mut self);
+    fn enabled(&self, _idx: usize) -> bool {
+        true
+    }
 }
 
 struct ScoreSink<'a> {
@@ -832,6 +865,9 @@ impl EvalSink for ScoreSink<'_> {
     }
     fn finish_global_group(&mut self) {
         self.total += self.sign * self.global_subtotal.take().unwrap();
+    }
+    fn enabled(&self, idx: usize) -> bool {
+        self.weights[idx] != 0.0
     }
 }
 
@@ -932,6 +968,9 @@ fn walk_side_pokemon<S: EvalSink>(side: &Side, sink: &mut S, sign: f32) {
         if pkmn.hp > 0 {
             walk_mon(pkmn, sink);
             walk_hazards(pkmn, side, sink);
+            if iter.pokemon_index != side.active_index && sink.enabled(feat::BENCH_HP) {
+                sink.global(feat::BENCH_HP, pkmn.hp as f32 / pkmn.maxhp.max(1) as f32);
+            }
             if iter.pokemon_index == side.active_index {
                 if side
                     .volatile_statuses
@@ -985,6 +1024,15 @@ fn walk_side_conditions<S: EvalSink>(side: &Side, sink: &mut S, sign: f32) {
     sink.global(feat::SAFE_GUARD, side.side_conditions.safeguard as f32);
     sink.global(feat::TAILWIND, side.side_conditions.tailwind as f32);
     sink.global(feat::HEALING_WISH, side.side_conditions.healing_wish as f32);
+    if sink.enabled(feat::WISH_RECOVERY) && side.wish.0 != 0 && side.wish.1 > 0 {
+        let wish_amount = side.wish.1 as f32;
+        let mut recoverable = 0.0f32;
+        for pokemon in side.pokemon.into_iter().filter(|pokemon| pokemon.hp > 0) {
+            let missing = (pokemon.maxhp - pokemon.hp).max(0) as f32;
+            recoverable = recoverable.max(wish_amount.min(missing) / pokemon.maxhp.max(1) as f32);
+        }
+        sink.global(feat::WISH_RECOVERY, recoverable);
+    }
 }
 
 fn walk_matchups<S: EvalSink>(state: &State, sink: &mut S, bench_scale: f32) {
@@ -1142,6 +1190,186 @@ pub fn eval_pair_features_with_bench_scale(
 
 pub fn eval_pair_features(state: &State) -> [[f32; NUM_EVAL_FEATURES]; 2] {
     eval_pair_features_with_bench_scale(state, DEFAULT_BENCH_SCALE)
+}
+
+fn add_state_candidates(side: &Side, active: usize, output: &mut [f32; NUM_EVAL_CANDIDATES]) {
+    const IDX: [crate::state::PokemonIndex; 6] = [
+        crate::state::PokemonIndex::P0,
+        crate::state::PokemonIndex::P1,
+        crate::state::PokemonIndex::P2,
+        crate::state::PokemonIndex::P3,
+        crate::state::PokemonIndex::P4,
+        crate::state::PokemonIndex::P5,
+    ];
+    for (index, pokemon_index) in IDX.iter().enumerate() {
+        let pokemon = &side.pokemon[*pokemon_index];
+        if pokemon.hp <= 0 {
+            continue;
+        }
+        let hp_ratio = pokemon.hp as f32 / pokemon.maxhp.max(1) as f32;
+        output[12] += hp_ratio * hp_ratio;
+        output[13] += (hp_ratio <= 0.25) as u8 as f32;
+        output[14] += (hp_ratio >= 0.5) as u8 as f32;
+        if index != active {
+            output[11] += hp_ratio;
+            let after_entry = entry_hp(side, pokemon).max(0);
+            output[0] += (pokemon.hp - after_entry) as f32 / pokemon.maxhp.max(1) as f32;
+            output[1] += (after_entry == 0) as u8 as f32;
+        }
+    }
+
+    let active_pokemon = &side.pokemon[IDX[active]];
+    if active_pokemon.hp > 0 {
+        output[10] = active_pokemon.hp as f32 / active_pokemon.maxhp.max(1) as f32;
+        if active_pokemon.status == PokemonStatus::TOXIC
+            && !matches!(
+                active_pokemon.ability,
+                Abilities::POISONHEAL | Abilities::MAGICGUARD
+            )
+        {
+            let next_stage = side.side_conditions.toxic_count.max(0) as f32 + 1.0;
+            let next_damage = active_pokemon.maxhp as f32 * next_stage / 16.0;
+            output[7] =
+                next_damage.min(active_pokemon.hp as f32) / active_pokemon.maxhp.max(1) as f32;
+        }
+        if side
+            .volatile_statuses
+            .contains(&PokemonVolatileStatus::SUBSTITUTE)
+        {
+            output[8] = side.substitute_health.max(0) as f32 / active_pokemon.maxhp.max(1) as f32;
+        }
+    }
+
+    if side.wish.0 != 0 && side.wish.1 > 0 {
+        let wish_amount = side.wish.1 as f32;
+        for pokemon in side.pokemon.into_iter().filter(|pokemon| pokemon.hp > 0) {
+            let missing = (pokemon.maxhp - pokemon.hp).max(0) as f32;
+            output[9] = output[9].max(wish_amount.min(missing) / pokemon.maxhp.max(1) as f32);
+        }
+    }
+}
+
+/// Per-side nonlinear feature candidates for offline discovery. This is kept
+/// separate from `eval_pair_features`: calling it has no effect on production
+/// evaluation cost or the stable production feature schema.
+pub fn eval_candidate_pair_features_with_bench_scale(
+    state: &State,
+    bench_scale: f32,
+) -> [[f32; NUM_EVAL_CANDIDATES]; 2] {
+    const IDX: [crate::state::PokemonIndex; 6] = [
+        crate::state::PokemonIndex::P0,
+        crate::state::PokemonIndex::P1,
+        crate::state::PokemonIndex::P2,
+        crate::state::PokemonIndex::P3,
+        crate::state::PokemonIndex::P4,
+        crate::state::PokemonIndex::P5,
+    ];
+    let kernel = MatchupKernel::new(state);
+    let active_one = state.side_one.active_index as usize;
+    let active_two = state.side_two.active_index as usize;
+    let mut output = [[0.0f32; NUM_EVAL_CANDIDATES]; 2];
+    add_state_candidates(&state.side_one, active_one, &mut output[0]);
+    add_state_candidates(&state.side_two, active_two, &mut output[1]);
+
+    let mut wins_one = [0usize; 6];
+    let mut wins_two = [0usize; 6];
+    let mut answer_count_one = [0usize; 6];
+    let mut answer_count_two = [0usize; 6];
+    let mut unique_answer_one = [0usize; 6];
+    let mut unique_answer_two = [0usize; 6];
+
+    for i in 0..6 {
+        if !kernel.alive_one[i] {
+            continue;
+        }
+        for j in 0..6 {
+            if !kernel.alive_two[j] {
+                continue;
+            }
+            match kernel.duel_one(state, i, j) {
+                DuelResult::Win => wins_one[i] += 1,
+                DuelResult::Loss => wins_two[j] += 1,
+                DuelResult::Draw => {}
+            }
+            if answers_after_entry(state, &kernel, true, i, j) {
+                answer_count_one[i] += 1;
+                unique_answer_one[i] = j;
+            }
+            if answers_after_entry(state, &kernel, false, j, i) {
+                answer_count_two[j] += 1;
+                unique_answer_two[j] = i;
+            }
+        }
+    }
+
+    let mut coverage_one = [0.0f32; 6];
+    let mut coverage_two = [0.0f32; 6];
+    for i in 0..6 {
+        if kernel.alive_one[i] && kernel.count_two > 0 {
+            let scale = if i == active_one { 1.0 } else { bench_scale };
+            coverage_one[i] = scale * wins_one[i] as f32 / kernel.count_two as f32;
+            if wins_one[i] == kernel.count_two {
+                let pokemon = &state.side_one.pokemon[IDX[i]];
+                let available_hp = if i == active_one {
+                    pokemon.hp
+                } else {
+                    entry_hp(&state.side_one, pokemon).max(0)
+                };
+                output[0][4] =
+                    output[0][4].max(scale * available_hp as f32 / pokemon.maxhp.max(1) as f32);
+            }
+            if answer_count_one[i] == 1 {
+                let answer = &state.side_two.pokemon[IDX[unique_answer_one[i]]];
+                let available_hp = entry_hp(&state.side_two, answer).max(0) as f32;
+                output[0][5] += scale * (1.0 - available_hp / answer.maxhp.max(1) as f32);
+            }
+        }
+        if kernel.alive_two[i] && kernel.count_one > 0 {
+            let scale = if i == active_two { 1.0 } else { bench_scale };
+            coverage_two[i] = scale * wins_two[i] as f32 / kernel.count_one as f32;
+            if wins_two[i] == kernel.count_one {
+                let pokemon = &state.side_two.pokemon[IDX[i]];
+                let available_hp = if i == active_two {
+                    pokemon.hp
+                } else {
+                    entry_hp(&state.side_two, pokemon).max(0)
+                };
+                output[1][4] =
+                    output[1][4].max(scale * available_hp as f32 / pokemon.maxhp.max(1) as f32);
+            }
+            if answer_count_two[i] == 1 {
+                let answer = &state.side_one.pokemon[IDX[unique_answer_two[i]]];
+                let available_hp = entry_hp(&state.side_one, answer).max(0) as f32;
+                output[1][5] += scale * (1.0 - available_hp / answer.maxhp.max(1) as f32);
+            }
+        }
+    }
+    coverage_one.sort_by(|a, b| b.total_cmp(a));
+    coverage_two.sort_by(|a, b| b.total_cmp(a));
+    output[0][2] = coverage_one[0];
+    output[0][3] = coverage_one[1];
+    output[1][2] = coverage_two[0];
+    output[1][3] = coverage_two[1];
+
+    for i in 0..6 {
+        if i != active_one
+            && kernel.alive_one[i]
+            && answers_after_entry(state, &kernel, false, active_two, i)
+        {
+            output[0][6] += 1.0;
+        }
+        if i != active_two
+            && kernel.alive_two[i]
+            && answers_after_entry(state, &kernel, true, active_one, i)
+        {
+            output[1][6] += 1.0;
+        }
+    }
+    output
+}
+
+pub fn eval_candidate_pair_features(state: &State) -> [[f32; NUM_EVAL_CANDIDATES]; 2] {
+    eval_candidate_pair_features_with_bench_scale(state, DEFAULT_BENCH_SCALE)
 }
 
 pub fn evaluate_with_config(state: &State, config: EvalConfig) -> f32 {
@@ -1422,7 +1650,7 @@ mod tests {
     }
 
     fn bundled_states() -> Vec<State> {
-        include_str!("../../data/gen9-battle-factory-no-ubers-states.txt")
+        include_str!("../../data/datasets/battle-factory/no-ubers-states.txt")
             .lines()
             .filter(|line| !line.is_empty())
             .map(State::deserialize)
@@ -1446,6 +1674,7 @@ mod tests {
         s.side_one.side_conditions.safeguard = 1;
         s.side_one.side_conditions.tailwind = 2;
         s.side_two.side_conditions.healing_wish = 1;
+        s.side_one.wish = (1, 100);
         variants.push(s);
 
         let mut s = base.clone();
@@ -1509,7 +1738,7 @@ mod tests {
         // The first 30 terms of the preserved handcrafted vector reproduce
         // the evaluator that predated feature decomposition.
         let mut historical =
-            parse_eval_weights(include_str!("../../data/eval-handcrafted-36.weights")).unwrap();
+            parse_eval_weights(include_str!("../../data/weights/eval-handcrafted-36.weights")).unwrap();
         historical[30..].fill(0.0);
         for state in bundled_states().iter() {
             for variant in mutated_variants(state) {
@@ -1640,6 +1869,44 @@ mod tests {
                     original[i],
                     mirrored[i]
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn bench_hp_and_wish_features_preserve_side_context() {
+        let mut state = bundled_states().remove(0);
+        let pair = eval_pair_features(&state);
+        let expected_bench_hp: f32 = state
+            .side_one
+            .pokemon
+            .into_iter()
+            .enumerate()
+            .filter(|(index, pokemon)| {
+                *index != state.side_one.active_index as usize && pokemon.hp > 0
+            })
+            .map(|(_, pokemon)| pokemon.hp as f32 / pokemon.maxhp.max(1) as f32)
+            .sum();
+        assert!((pair[0][feat::BENCH_HP] - expected_bench_hp).abs() < 1e-6);
+        assert_eq!(pair[0][feat::WISH_RECOVERY], 0.0);
+
+        state.side_one.pokemon.pkmn[1].hp = 1;
+        state.side_one.wish = (1, 100);
+        let with_wish = eval_pair_features(&state);
+        assert!(with_wish[0][feat::WISH_RECOVERY] > 0.0);
+        assert_eq!(with_wish[1][feat::WISH_RECOVERY], 0.0);
+    }
+
+    #[test]
+    fn candidate_features_are_side_swap_symmetric() {
+        for state in bundled_states() {
+            let original = eval_candidate_pair_features(&state);
+            let mut swapped = state.clone();
+            std::mem::swap(&mut swapped.side_one, &mut swapped.side_two);
+            let mirrored = eval_candidate_pair_features(&swapped);
+            for feature in 0..NUM_EVAL_CANDIDATES {
+                assert!((original[0][feature] - mirrored[1][feature]).abs() < 1e-5);
+                assert!((original[1][feature] - mirrored[0][feature]).abs() < 1e-5);
             }
         }
     }

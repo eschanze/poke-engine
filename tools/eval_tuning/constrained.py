@@ -13,7 +13,7 @@ from tune import FEATURE_NAMES, bce_grad, split_by_state_index
 
 def load_handcrafted_weights():
     """Load the fixed pre-tuning baseline used to reproduce this experiment."""
-    path = Path(__file__).resolve().parents[2] / "data" / "eval-handcrafted-36.weights"
+    path = Path(__file__).resolve().parents[2] / "data" / "weights" / "eval-handcrafted-36.weights"
     values = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.split("#", 1)[0].strip()
@@ -63,6 +63,8 @@ BOUNDS = {
     "UNANSWERED": (0, 100),
     "ACTIVE_DUEL": (0, 80),
     "PIVOT_PRESSURE": (0, 80),
+    "BENCH_HP": (0, 40),
+    "WISH_RECOVERY": (0, 100),
 }
 
 LOWER = np.asarray([BOUNDS[name][0] for name in FEATURE_NAMES], dtype=np.float64)

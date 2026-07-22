@@ -9,7 +9,10 @@ fn main() {
 #[cfg(not(any(feature = "gen1", feature = "gen2", feature = "gen3")))]
 mod genx_main {
     use clap::Parser;
-    use poke_engine::engine::evaluate::{eval_pair_features_with_bench_scale, DEFAULT_BENCH_SCALE};
+    use poke_engine::engine::evaluate::{
+        eval_candidate_pair_features_with_bench_scale, eval_pair_features_with_bench_scale,
+        DEFAULT_BENCH_SCALE,
+    };
     use poke_engine::state::State;
     use std::io::{BufRead, BufReader, BufWriter, Write};
 
@@ -24,6 +27,9 @@ mod genx_main {
         /// Bench discount used during matchup feature extraction.
         #[clap(long, default_value_t = DEFAULT_BENCH_SCALE)]
         bench_scale: f32,
+        /// Also emit experimental candidate feature vectors.
+        #[clap(long)]
+        experimental_candidates: bool,
     }
 
     fn serialized_state(line: &str, line_no: usize) -> Result<&str, String> {
@@ -85,6 +91,14 @@ mod genx_main {
             write_vector(&mut output, &pair[0]).unwrap();
             output.write_all(b",\"side_two\":").unwrap();
             write_vector(&mut output, &pair[1]).unwrap();
+            if args.experimental_candidates {
+                let candidates =
+                    eval_candidate_pair_features_with_bench_scale(&state, args.bench_scale);
+                output.write_all(b",\"candidate_one\":").unwrap();
+                write_vector(&mut output, &candidates[0]).unwrap();
+                output.write_all(b",\"candidate_two\":").unwrap();
+                write_vector(&mut output, &candidates[1]).unwrap();
+            }
             output.write_all(b"}\n").unwrap();
             count += 1;
         }

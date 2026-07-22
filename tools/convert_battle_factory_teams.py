@@ -6,13 +6,20 @@ move PP.  Build a small local Dex snapshot once from Pokémon Showdown's public
 ``pokedex.ts`` and ``moves.ts`` files, then rerun this tool offline.
 
 Example:
-    python tools/convert_battle_factory_teams.py --build-dex \
-        --pokedex-ts C:\\path\\to\\pokedex.ts --moves-ts C:\\path\\to\\moves.ts
-    python tools/convert_battle_factory_teams.py
+    node tools/showdown_import_to_packed.js --output packed.txt team-a.txt team-b.txt
+    python tools/convert_battle_factory_teams.py --input packed.txt --output states.txt
+    python tools/convert_battle_factory_teams.py --input packed.txt \
+        --output round-robin.txt --pairing round-robin
 
-The resulting states pair adjacent source rows (1 vs 2, 3 vs 4, ...).  They
-are immediately usable turn-one states: each side leads with its first listed
-Pokémon, all Pokémon have full HP and PP, and the field is clear.
+To build or refresh the local Dex used by the second command:
+    python tools/convert_battle_factory_teams.py --input packed.txt \
+        --output states.txt --dex dex.json --build-dex \
+        --pokedex-ts C:\\path\\to\\pokedex.ts --moves-ts C:\\path\\to\\moves.ts
+
+By default the resulting states pair adjacent source rows (1 vs 2, 3 vs 4,
+...). ``--pairing round-robin`` instead emits every unordered team pair. The
+states are immediately usable at turn one: each side leads with its first
+listed Pokémon, all Pokémon have full HP and PP, and the field is clear.
 """
 
 from __future__ import annotations
@@ -28,22 +35,34 @@ from typing import Iterable
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_INPUT = ROOT / "gen9-battle-factory-no-ubers.txt"
-DEFAULT_OUTPUT = ROOT / "data" / "gen9-battle-factory-no-ubers-states.txt"
-DEFAULT_DEX = ROOT / "data" / "gen9-battle-factory-no-ubers-dex.json"
+DEFAULT_OUTPUT = ROOT / "data" / "datasets" / "battle-factory" / "no-ubers-states.txt"
+DEFAULT_DEX = ROOT / "data" / "datasets" / "battle-factory" / "no-ubers-dex.json"
 
 NATURE_EFFECTS = {
     "ADAMANT": ("ATK", "SPA"),
+    "BASHFUL": (None, None),
     "BOLD": ("DEF", "ATK"),
+    "BRAVE": ("ATK", "SPE"),
     "CALM": ("SPD", "ATK"),
     "CAREFUL": ("SPD", "SPA"),
+    "DOCILE": (None, None),
+    "GENTLE": ("SPD", "DEF"),
+    "HARDY": (None, None),
     "HASTY": ("SPE", "DEF"),
     "IMPISH": ("DEF", "SPA"),
     "JOLLY": ("SPE", "SPA"),
+    "LAX": ("DEF", "SPD"),
+    "LONELY": ("ATK", "DEF"),
+    "MILD": ("SPA", "DEF"),
     "MODEST": ("SPA", "ATK"),
     "NAIVE": ("SPE", "SPD"),
+    "NAUGHTY": ("ATK", "SPD"),
     "QUIET": ("SPA", "SPE"),
+    "QUIRKY": (None, None),
+    "RASH": ("SPA", "SPD"),
     "RELAXED": ("DEF", "SPE"),
     "SASSY": ("SPD", "SPE"),
+    "SERIOUS": (None, None),
     "TIMID": ("SPE", "ATK"),
 }
 
@@ -97,8 +116,6 @@ def parse_pokemon(packed: str, line_number: int, slot: int) -> PackedPokemon:
 
     extra_fields = extra.split(",")
     tera_type = extra_fields[5] if len(extra_fields) > 5 else ""
-    if not tera_type:
-        raise ValueError(f"line {line_number}, Pokémon {slot}: missing Tera type")
 
     return PackedPokemon(
         species=to_id(species or nickname),
@@ -126,8 +143,6 @@ def parse_teams(path: Path) -> list[list[PackedPokemon]]:
             [parse_pokemon(packed, line_number, slot) for slot, packed in enumerate(packed_team, 1)]
         )
 
-    if len(teams) % 2:
-        raise ValueError(f"expected an even number of teams, got {len(teams)}")
     return teams
 
 
@@ -224,8 +239,9 @@ def calculate_stats(pokemon: PackedPokemon, species: dict[str, object]) -> tuple
         boosted, reduced = NATURE_EFFECTS[pokemon.nature]
     except KeyError as error:
         raise ValueError(f"unsupported nature {pokemon.nature}") from error
-    stats[boosted] = stats[boosted] * 110 // 100
-    stats[reduced] = stats[reduced] * 90 // 100
+    if boosted is not None and reduced is not None:
+        stats[boosted] = stats[boosted] * 110 // 100
+        stats[reduced] = stats[reduced] * 90 // 100
     return hp, stats["ATK"], stats["DEF"], stats["SPA"], stats["SPD"], stats["SPE"]
 
 
@@ -285,7 +301,7 @@ def serialize_pokemon(
             format_number(species["weight_kg"]),
             *move_strings,
             "false",
-            pokemon.tera_type,
+            pokemon.tera_type or types[0],
         ]
     )
 
@@ -308,7 +324,9 @@ def serialize_side(team: list[PackedPokemon], dex_species: dict[str, dict[str, o
     return "=".join(fields)
 
 
-def serialize_states(teams: list[list[PackedPokemon]], dex: dict[str, object]) -> tuple[list[str], set[str]]:
+def serialize_states(
+    teams: list[list[PackedPokemon]], dex: dict[str, object], pairing: str = "adjacent"
+) -> tuple[list[str], set[str]]:
     try:
         dex_species = dex["species"]
         dex_moves = dex["moves"]
@@ -318,8 +336,23 @@ def serialize_states(teams: list[list[PackedPokemon]], dex: dict[str, object]) -
         raise ValueError("invalid Dex snapshot")
 
     substituted_items: set[str] = set()
+    if pairing == "adjacent":
+        if len(teams) % 2:
+            raise ValueError(f"adjacent pairing requires an even number of teams, got {len(teams)}")
+        matchups = zip(teams[::2], teams[1::2])
+    elif pairing == "round-robin":
+        matchups = (
+            (teams[first], teams[second])
+            if (second - first) % len(teams) <= len(teams) // 2
+            else (teams[second], teams[first])
+            for first in range(len(teams))
+            for second in range(first + 1, len(teams))
+        )
+    else:
+        raise ValueError(f"unsupported pairing mode {pairing!r}")
+
     states = []
-    for first, second in zip(teams[::2], teams[1::2]):
+    for first, second in matchups:
         side_one = serialize_side(first, dex_species, dex_moves, substituted_items)  # type: ignore[arg-type]
         side_two = serialize_side(second, dex_species, dex_moves, substituted_items)  # type: ignore[arg-type]
         states.append(f"{side_one}/{side_two}/NONE;-1/NONE;0/false;0/false")
@@ -331,6 +364,10 @@ def main() -> None:
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT, help=f"compact team input (default: {DEFAULT_INPUT})")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help=f"serialized state output (default: {DEFAULT_OUTPUT})")
     parser.add_argument("--dex", type=Path, default=DEFAULT_DEX, help=f"local Dex snapshot (default: {DEFAULT_DEX})")
+    parser.add_argument(
+        "--pairing", choices=("adjacent", "round-robin"), default="adjacent",
+        help="pair adjacent input teams (default) or emit every unordered pair",
+    )
     parser.add_argument("--build-dex", action="store_true", help="create/update --dex from the supplied Showdown TypeScript files")
     parser.add_argument("--pokedex-ts", type=Path, help="Pokémon Showdown data/pokedex.ts; required with --build-dex")
     parser.add_argument("--moves-ts", type=Path, help="Pokémon Showdown data/moves.ts; required with --build-dex")
@@ -346,10 +383,13 @@ def main() -> None:
     else:
         dex = json.loads(args.dex.read_text(encoding="utf-8"))
 
-    states, substituted_items = serialize_states(teams, dex)
+    states, substituted_items = serialize_states(teams, dex, args.pairing)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text("\n".join(states) + "\n", encoding="utf-8")
-    print(f"Converted {len(teams)} teams into {len(states)} paired battle states: {args.output}")
+    print(
+        f"Converted {len(teams)} teams into {len(states)} {args.pairing} battle states: "
+        f"{args.output}"
+    )
     if substituted_items:
         print(
             "Mapped unsupported engine items to UNKNOWNITEM: " + ", ".join(sorted(substituted_items)),

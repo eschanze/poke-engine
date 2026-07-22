@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Constrained 36-feature refit on merged re-extracted dumps.
+"""Constrained current-schema refit on merged re-extracted dumps.
 
 Feature vectors are recomputed from the serialized states by the
-eval_pair_features binary (current 36-feature engine schema), so dumps
+eval_pair_features binary (current engine schema), so dumps
 written under older feature schemas remain usable. Rows are weighted so
 every decisive game contributes equal total weight, and validation folds
 are grouped by (globally remapped) starting-state index.

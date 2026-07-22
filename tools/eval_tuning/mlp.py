@@ -22,7 +22,7 @@ from sweep import fit as fit_linear
 from tune import DEFAULT_WEIGHTS, FEATURE_NAMES, FEATURE_SCHEMA, split_by_state_index
 
 
-def load_positions(paths):
+def load_positions(paths, target="outcome"):
     records = []
     truncated = set()
     for path_text in paths:
@@ -47,8 +47,10 @@ def load_positions(paths):
     game_ids = np.asarray(
         [game_lookup.setdefault(key, len(game_lookup)) for key, _ in usable], dtype=np.int64
     )
+    if any(target not in rec for _, rec in usable):
+        sys.exit(f"--target {target} needs relabeled data (see relabel-root-value)")
     x = np.asarray([rec["features"] for _, rec in usable], dtype=np.float32)
-    y = np.asarray([rec["outcome"] for _, rec in usable], dtype=np.float32)
+    y = np.asarray([rec[target] for _, rec in usable], dtype=np.float32)
     state_indices = np.asarray([rec["state_index"] for _, rec in usable], dtype=np.int64)
     if x.ndim != 2 or x.shape[1] != len(FEATURE_NAMES):
         sys.exit("trajectory feature width does not match the current evaluator")
@@ -179,9 +181,11 @@ def main():
     ap.add_argument("--weight-decay", type=float, nargs="+", default=[0.001, 0.01, 0.1])
     ap.add_argument("--correction-clip", type=float, default=1.0)
     ap.add_argument("--max-epochs", type=int, default=2000)
+    ap.add_argument("--target", choices=["outcome", "root_value"], default="outcome",
+                    help="training label: game outcome or relabeled teacher root value")
     args = ap.parse_args()
 
-    x, y, state_indices, weights = load_positions(args.data)
+    x, y, state_indices, weights = load_positions(args.data, args.target)
     folds = [split_by_state_index(state_indices, 0.2, seed) for seed in range(5)]
     fold_bases = []
     fold_scales = []

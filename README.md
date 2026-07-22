@@ -15,6 +15,8 @@ It is nowhere near as complete or robust as the [PokemonShowdown](https://github
 
 #### [Eval tuning](tools/eval_tuning/README.md)
 
+#### [Team conversion and self-play tools](tools/README.md)
+
 ## Running Directly
 
 ### Building

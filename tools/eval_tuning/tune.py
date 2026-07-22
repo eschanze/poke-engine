@@ -64,6 +64,8 @@ FEATURE_NAMES = [
     "UNANSWERED",
     "ACTIVE_DUEL",
     "PIVOT_PRESSURE",
+    "BENCH_HP",
+    "WISH_RECOVERY",
 ]
 
 DEFAULT_WEIGHTS = np.array(
@@ -104,6 +106,8 @@ DEFAULT_WEIGHTS = np.array(
         20.1621173,   # UNANSWERED
         4.86702255,   # ACTIVE_DUEL
         3.7430539,    # PIVOT_PRESSURE
+        0.0,          # BENCH_HP (experimental candidate: 2.0)
+        0.0,          # WISH_RECOVERY (experimental candidate: 47.0)
     ],
     dtype=np.float64,
 )
